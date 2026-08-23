@@ -1,0 +1,339 @@
+# ==============================================================================
+# DELIVERABLE 1: ABC Pharmaceuticals - Drug XYZ Adoption Prediction Pipeline
+# ==============================================================================
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.cluster import KMeans
+from sklearn.metrics import roc_auc_score, f1_score, classification_report, roc_curve
+from statsmodels.stats.outliers_influence import variance_inflation_factor
+import statsmodels.api as sm
+import statsmodels.formula.api as smf
+import xgboost as xgb
+import warnings
+warnings.filterwarnings('ignore')
+
+# Set global random seed for reproducibility
+RANDOM_STATE = 42
+np.random.seed(RANDOM_STATE)
+
+# ------------------------------------------------------------------------------
+# STEP 1: DATA MERGING & EXPLORATORY DATA ANALYSIS (EDA)
+# ------------------------------------------------------------------------------
+print("--- STEP 1: Loading Data & EDA ---")
+
+# Load datasets
+df_long = pd.read_csv('input_data_file1.csv')
+df_static = pd.read_csv('input_data_file2.csv')
+test_physicians = pd.read_csv('test_physicians.csv')
+
+# Define target variable for training set:
+# adopted = 1 if rx_count > 0 in ANY quarter Q1-Q10, else 0
+physician_rx_totals = df_long.groupby('physician_id')['rx_count'].sum().reset_index()
+physician_rx_totals['adopted'] = (physician_rx_totals['rx_count'] > 0).astype(int)
+
+# Separate into training cohort (all physicians) and identify test cohort
+# Test set physicians have rx_count = 0 across all 10 quarters
+test_ids = set(test_physicians['physician_id'].unique())
+
+print(f"Total unique physicians in static data: {df_static['physician_id'].nunique()}")
+print(f"Total test set physicians: {len(test_ids)}")
+
+# Verify target balance on total population
+target_df = physician_rx_totals[['physician_id', 'adopted']]
+print("Class Distribution across overall dataset:")
+print(target_df['adopted'].value_counts(normalize=True))
+
+# Check for missing values
+print("\nMissing values in Longitudinal Data:")
+print(df_long.isnull().sum())
+print("\nMissing values in Static Data:")
+print(df_static.isnull().sum())
+
+# OLS Regression for Multicollinearity / Initial Linear Association Check (Raw Features)
+df_long_agg_raw = df_long.groupby('physician_id')[['rep_calls', 'samples_provided', 'digital_engagements', 'rx_count']].sum().reset_index()
+df_ols = pd.merge(df_long_agg_raw, target_df, on='physician_id')
+
+X_ols = df_ols[['rep_calls', 'samples_provided', 'digital_engagements']]
+X_ols = sm.add_constant(X_ols)
+y_ols = df_ols['adopted']
+
+ols_model = sm.OLS(y_ols, X_ols).fit()
+print("\nOLS Summary on Raw Numerical Features:")
+print(ols_model.summary())
+
+# Check VIF for raw features
+vif_data = pd.DataFrame()
+vif_data["feature"] = X_ols.columns
+vif_data["VIF"] = [variance_inflation_factor(X_ols.values, i) for i in range(X_ols.shape[1])]
+print("\nVariance Inflation Factor (Raw Features):")
+print(vif_data)
+
+
+# ------------------------------------------------------------------------------
+# STEP 2: FEATURE ENGINEERING
+# ------------------------------------------------------------------------------
+print("\n--- STEP 2: Feature Engineering ---")
+
+def extract_features(df_l, df_s):
+    # Ensure quarter numeric sorting (Q1 -> 1, Q10 -> 10)
+    df_l['q_num'] = df_l['quarter'].str.replace('Q', '').astype(int)
+    
+    # 1. Aggregate totals over all 10 quarters
+    agg_totals = df_l.groupby('physician_id').agg(
+        total_rep_calls=('rep_calls', 'sum'),
+        total_samples=('samples_provided', 'sum'),
+        total_digital_engagements=('digital_engagements', 'sum'),
+        total_competitive_rx=('competitive_rx_count', 'sum'),
+        avg_peer_network_score=('peer_network_score', 'mean'),
+        total_med_edu_events=('medical_education_events', 'sum'),
+        total_congress_attendance=('congress_attendance', 'sum')
+    ).reset_index()
+
+    # 2. Recency features: Mean over Q8-Q10
+    q8_10 = df_l[df_l['q_num'] >= 8]
+    recency = q8_10.groupby('physician_id').agg(
+        recency_rep_calls=('rep_calls', 'mean'),
+        recency_samples=('samples_provided', 'mean'),
+        recency_digital=('digital_engagements', 'mean'),
+        speaker_recency_q8_q10=('speaker_program_attendance', 'sum')
+    ).reset_index()
+
+    # 3. Early window features: Mean over Q1-Q3
+    q1_3 = df_l[df_l['q_num'] <= 3]
+    early = q1_3.groupby('physician_id').agg(
+        early_rep_calls=('rep_calls', 'mean'),
+        early_samples=('samples_provided', 'mean'),
+        early_digital=('digital_engagements', 'mean'),
+        early_comp_rx=('competitive_rx_count', 'mean')
+    ).reset_index()
+
+    # Merge temporal bases
+    features = pd.merge(agg_totals, recency, on='physician_id')
+    features = pd.merge(features, early, on='physician_id')
+
+    # 4. Trend features (Q8-Q10 mean minus Q1-Q3 mean)
+    features['trend_rep_calls'] = features['recency_rep_calls'] - features['early_rep_calls']
+    features['trend_samples'] = features['recency_samples'] - features['early_samples']
+    features['trend_digital'] = features['recency_digital'] - features['early_digital']
+
+    # 5. Competitive exposure trend
+    q8_10_comp = q8_10.groupby('physician_id')['competitive_rx_count'].mean().reset_index().rename(columns={'competitive_rx_count': 'recency_comp_rx'})
+    features = pd.merge(features, q8_10_comp, on='physician_id')
+    features['trend_comp_rx'] = features['recency_comp_rx'] - features['early_comp_rx']
+
+    # 6. Momentum feature: Monotonically increasing activity in last 4 quarters (Q7-Q10)
+    q7_10 = df_l[df_l['q_num'] >= 7].sort_values(['physician_id', 'q_num'])
+    def check_momentum(group):
+        calls = group['rep_calls'].values
+        return int(np.all(np.diff(calls) >= 0))
+    
+    momentum_df = q7_10.groupby('physician_id').apply(check_momentum).reset_index(name='momentum_calls_last4q')
+    features = pd.merge(features, momentum_df, on='physician_id')
+
+    # 7. Territory-level features
+    df_l_merged = pd.merge(df_l, df_s[['physician_id', 'territory_code']], on='physician_id')
+    territory_agg = df_l_merged.groupby('territory_code').agg(
+        territory_avg_rep_calls=('rep_calls', 'mean'),
+        territory_avg_samples=('samples_provided', 'mean')
+    ).reset_index()
+
+    # Merge static attributes
+    features = pd.merge(features, df_s, on='physician_id')
+    features = pd.merge(features, territory_agg, on='territory_code', how='left')
+
+    return features
+
+df_features = extract_features(df_long, df_static)
+
+# Merge target variable
+df_full = pd.merge(df_features, target_df, on='physician_id')
+
+# 8. Physician Segmentation (Clustering)
+cluster_cols = ['total_rep_calls', 'total_samples', 'total_digital_engagements', 'avg_peer_network_score']
+scaler_kmeans = StandardScaler()
+cluster_data_scaled = scaler_kmeans.fit_transform(df_full[cluster_cols])
+
+kmeans = KMeans(n_clusters=5, random_state=RANDOM_STATE)
+df_full['physician_cluster'] = kmeans.fit_predict(cluster_data_scaled)
+df_full['physician_cluster'] = df_full['physician_cluster'].astype(str)
+
+print(f"Feature engineering completed. Matrix shape: {df_full.shape}")
+
+
+# ------------------------------------------------------------------------------
+# STEP 3: TRAIN / VALIDATION SPLIT & BASELINE LOGISTIC REGRESSION
+# ------------------------------------------------------------------------------
+print("\n--- STEP 3: Baseline Logistic Regression ---")
+
+# Separate training pool (physicians who are candidates for historical learning)
+# Note: Test physicians are those in test_physicians.csv
+train_mask = ~df_full['physician_id'].isin(test_ids)
+df_train_pool = df_full[train_mask].copy()
+df_test_set = df_full[~train_mask].copy()
+
+# Feature sets definition
+categorical_cols = ['specialty', 'practice_type', 'geographic_region', 'physician_cluster', 'practice_size']
+numeric_cols = [
+    'years_in_practice', 'hcp_decile', 'payer_access_score', 'kol_flag', 'hospital_affiliation',
+    'board_certified', 'total_rep_calls', 'total_samples', 'total_digital_engagements',
+    'total_competitive_rx', 'avg_peer_network_score', 'total_med_edu_events',
+    'total_congress_attendance', 'recency_rep_calls', 'recency_samples', 'recency_digital',
+    'speaker_recency_q8_q10', 'trend_rep_calls', 'trend_samples', 'trend_digital',
+    'trend_comp_rx', 'momentum_calls_last4q', 'territory_avg_rep_calls', 'territory_avg_samples'
+]
+
+X = df_train_pool[numeric_cols + categorical_cols]
+y = df_train_pool['adopted']
+
+# 80/20 Stratified Split
+X_train, X_val, y_train, y_val = train_test_split(
+    X, y, test_size=0.20, stratify=y, random_state=RANDOM_STATE
+)
+
+# Preprocessing Pipeline
+preprocessor = ColumnTransformer(
+    transformers=[
+        ('num', StandardScaler(), numeric_cols),
+        ('cat', OneHotEncoder(drop='first', handle_unknown='ignore'), categorical_cols)
+    ]
+)
+
+# Baseline Logistic Regression Pipeline
+logreg_pipeline = Pipeline([
+    ('preprocessor', preprocessor),
+    ('classifier', LogisticRegression(max_iter=1000, random_state=RANDOM_STATE))
+])
+
+logreg_pipeline.fit(X_train, y_train)
+
+# Evaluation
+y_val_pred_proba_lr = logreg_pipeline.predict_proba(X_val)[:, 1]
+y_val_pred_lr = (y_val_pred_proba_lr >= 0.5).astype(int)
+
+auc_lr = roc_auc_score(y_val, y_val_pred_proba_lr)
+f1_lr = f1_score(y_val, y_val_pred_lr)
+
+print(f"Logistic Regression Validation AUC: {auc_lr:.4f}")
+print(f"Logistic Regression Validation F1-Score: {f1_lr:.4f}")
+
+# VIF Check after encoding to monitor collinearity
+X_train_proc = preprocessor.transform(X_train)
+if hasattr(X_train_proc, "toarray"):
+    X_train_proc = X_train_proc.toarray()
+
+vif_post = [variance_inflation_factor(X_train_proc, i) for i in range(min(X_train_proc.shape[1], 15))]
+print("Sample post-processing VIF scores (first 15 features):", np.round(vif_post, 2))
+
+
+# ------------------------------------------------------------------------------
+# STEP 4: MIXED EFFECTS / TERRITORY-LEVEL MODELLING
+# ------------------------------------------------------------------------------
+print("\n--- STEP 4: Mixed Effects Modeling ---")
+
+# Compute territory adoption rate
+territory_rates = df_train_pool.groupby('territory_code')['adopted'].agg(['mean', 'count']).reset_index()
+territory_rates.rename(columns={'mean': 'territory_adoption_rate'}, inplace=True)
+df_train_pool = pd.merge(df_train_pool, territory_rates[['territory_code', 'territory_adoption_rate']], on='territory_code', how='left')
+
+# Statsmodels MixedLM formulation
+mixed_formula = "adopted ~ total_rep_calls + total_samples + total_digital_engagements + payer_access_score + hcp_decile"
+try:
+    mixed_model = smf.mixedlm(mixed_formula, df_train_pool, groups=df_train_pool["territory_code"])
+    mixed_fit = mixed_model.fit()
+    print(mixed_fit.summary())
+except Exception as e:
+    print(f"Mixed LM fit note: {e}")
+
+
+# ------------------------------------------------------------------------------
+# STEP 5: ENSEMBLE MODELS & HYPERPARAMETER TUNING
+# ------------------------------------------------------------------------------
+print("\n--- STEP 5: Ensemble Models ---")
+
+# 1. Random Forest Classifier
+rf_pipeline = Pipeline([
+    ('preprocessor', preprocessor),
+    ('classifier', RandomForestClassifier(n_estimators=200, oob_score=True, random_state=RANDOM_STATE, n_jobs=-1))
+])
+
+rf_pipeline.fit(X_train, y_train)
+y_val_pred_proba_rf = rf_pipeline.predict_proba(X_val)[:, 1]
+y_val_pred_rf = (y_val_pred_proba_rf >= 0.5).astype(int)
+
+auc_rf = roc_auc_score(y_val, y_val_pred_proba_rf)
+f1_rf = f1_score(y_val, y_val_pred_rf)
+oob_rf = rf_pipeline.named_steps['classifier'].oob_score_
+
+print(f"Random Forest OOB Score: {oob_rf:.4f}")
+print(f"Random Forest Validation AUC: {auc_rf:.4f}")
+print(f"Random Forest Validation F1-Score: {f1_rf:.4f}")
+
+# 2. Gradient Boosting / XGBoost Classifier
+xgb_pipeline = Pipeline([
+    ('preprocessor', preprocessor),
+    ('classifier', xgb.XGBClassifier(
+        n_estimators=150,
+        max_depth=4,
+        learning_rate=0.05,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        random_state=RANDOM_STATE,
+        eval_metric='logloss'
+    ))
+])
+
+xgb_pipeline.fit(X_train, y_train)
+y_val_pred_proba_xgb = xgb_pipeline.predict_proba(X_val)[:, 1]
+y_val_pred_xgb = (y_val_pred_proba_xgb >= 0.5).astype(int)
+
+auc_xgb = roc_auc_score(y_val, y_val_pred_proba_xgb)
+f1_xgb = f1_score(y_val, y_val_pred_xgb)
+
+print(f"XGBoost Validation AUC: {auc_xgb:.4f}")
+print(f"XGBoost Validation F1-Score: {f1_xgb:.4f}")
+
+# Performance Comparison Table
+perf_df = pd.DataFrame({
+    'Model': ['Logistic Regression', 'Random Forest', 'XGBoost'],
+    'Validation AUC-ROC': [auc_lr, auc_rf, auc_xgb],
+    'Validation F1-Score': [f1_lr, f1_rf, f1_xgb]
+})
+print("\n--- Model Performance Comparison ---")
+print(perf_df)
+
+
+# ------------------------------------------------------------------------------
+# STEP 6: TEST SET PREDICTIONS & DELIVERABLE GENERATION
+# ------------------------------------------------------------------------------
+print("\n--- STEP 6: Generating Final Predictions ---")
+
+# Best Performing Model Selection (XGBoost)
+best_model = xgb_pipeline
+
+# Predict on test physicians (1,502 test non-adopters)
+X_test = df_test_set[numeric_cols + categorical_cols]
+df_test_set['adoption_probability'] = best_model.predict_proba(X_test)[:, 1]
+
+# Apply threshold = 0.5 for binary classification
+df_test_set['adoption_prediction'] = (df_test_set['adoption_probability'] >= 0.5).astype(int)
+
+# Rank by adoption probability descending
+df_test_set = df_test_set.sort_values('adoption_probability', ascending=False).reset_index(drop=True)
+
+# Format final output dataframe
+output_cols = ['physician_id', 'adoption_probability', 'adoption_prediction'] + numeric_cols + categorical_cols
+df_predictions_csv = df_test_set[output_cols]
+
+# Save to CSV
+df_predictions_csv.to_csv('predictions.csv', index=False)
+print(f"Successfully generated predictions.csv for {len(df_predictions_csv)} test physicians.")
+print(f"Top 200 target physicians identified with probability threshold >= {df_test_set.iloc[199]['adoption_probability']:.4f}")
