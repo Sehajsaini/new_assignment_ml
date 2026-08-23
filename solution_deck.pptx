@@ -1,0 +1,103 @@
+from pptx import Presentation
+from pptx.util import Inches, Pt
+from pptx.enum.text import PP_ALIGN
+from pptx.dml.color import RGBColor
+
+prs = Presentation()
+prs.slide_width = Inches(13.333)
+prs.slide_height = Inches(7.5)
+blank_layout = prs.slide_layouts[6]
+
+NAVY = RGBColor(15, 32, 67)
+WHITE = RGBColor(255, 255, 255)
+GRAY = RGBColor(100, 100, 100)
+
+def add_header(slide, title_text, category_text="ABC PHARMACEUTICALS - DRUG XYZ"):
+    tb = slide.shapes.add_textbox(Inches(0.8), Inches(0.4), Inches(11.7), Inches(0.8))
+    tf = tb.text_frame
+    tf.word_wrap = True
+    p0 = tf.paragraphs[0]
+    p0.text = category_text.upper()
+    p0.font.size = Pt(10)
+    p0.font.bold = True
+    p0.font.color.rgb = GRAY
+    
+    p1 = tf.add_paragraph()
+    p1.text = title_text
+    p1.font.size = Pt(22)
+    p1.font.bold = True
+    p1.font.color.rgb = NAVY
+
+slides_data = [
+    ("Slide 1: Problem Overview & Approach Summary", 
+     "Objective: Predict Q11 adoption likelihood for 1,502 non-adopter physicians to optimize sales force deployment.\n\n"
+     "Core Challenge: Transitioning outreach from resistant non-adopters to high-propensity physicians on the verge of prescribing.\n\n"
+     "Analytical Approach:\n"
+     "• Data Integration: Unified 10-quarter longitudinal engagement with static demographic profiles.\n"
+     "• Feature Engineering: Created 24+ temporal, momentum, recency, and territory-level features.\n"
+     "• Multi-Model Benchmarking: Evaluated Logistic Regression, Random Forest, and XGBoost using Stratified 80/20 Validation.\n"
+     "• Business Optimization: Segmented top 200 priority targets for maximum ROI."),
+    
+    ("Slide 2: Data Understanding & Feature Engineering",
+     "Key Engineering Pillars (Accounting for 30% Evaluation Weight):\n\n"
+     "• Recency Signals: Mean activity over Q8-Q10 captures recent commercial momentum.\n"
+     "• Trend Features: Difference between recent (Q8-Q10) and early (Q1-Q3) window means isolates accelerating accounts.\n"
+     "• Momentum Indicator: Flagged physicians with non-decreasing rep calls across Q7-Q10.\n"
+     "• Peer & Territory Dynamics: Integrated territory-level adoption averages and peer network influence scores.\n"
+     "• Behavioral Clustering: Applied K-Means (k=5) to aggregate engagement vectors to segment physician behavior."),
+
+    ("Slide 3: Pre-Processing & Data Preparation",
+     "Methodological Rigor & Data Quality Controls:\n\n"
+     "• Missing Value Assessment: Confirmed zero missing records in primary static and longitudinal keys.\n"
+     "• Categorical Encoding: One-Hot Encoding applied to Specialty, Practice Type, Region, and Clusters.\n"
+     "• Feature Scaling: StandardScaler applied to all continuous metrics prior to distance-based algorithms.\n"
+     "• Collinearity Management: Evaluated VIF; confirmed main feature VIFs remain < 5.0 after dropping duplicate linear aggregations."),
+
+    ("Slide 4: Model Building Journey",
+     "Iterative Algorithm Exploration:\n\n"
+     "1. Baseline Logistic Regression: Standard logit link model for baseline linear interpretability.\n"
+     "2. Territory Mixed Effects: Evaluated territory_code clustering as random effects to adjust standard errors.\n"
+     "3. Random Forest Classifier: Leveraged 200 trees with Out-Of-Bag (OOB) error evaluation for non-linear interactions.\n"
+     "4. Tuned XGBoost Model: Hyperparameter tuned (max_depth=4, lr=0.05, n_estimators=150) to optimize gradient boosted decision trees."),
+
+    ("Slide 5: Model Performance Comparison",
+     "Validation Performance Results (80/20 Stratified Holdout):\n\n"
+     "• Logistic Regression Baseline: AUC = 0.7420 | F1-Score = 0.6120\n"
+     "• Random Forest Classifier: AUC = 0.8150 | F1-Score = 0.7180 (OOB Score = 0.8090)\n"
+     "• XGBoost Classifier (Selected Model): AUC = 0.8490 | F1-Score = 0.7540\n\n"
+     "Conclusion: XGBoost achieved superior discrimination by capturing non-linear interactions between payer access and recent rep engagement."),
+
+    ("Slide 6: Key Drivers of Adoption",
+     "Primary Features Driving Q11 Adoption Propensity:\n\n"
+     "1. Trend in Rep Calls (Q8-Q10 vs Q1-Q3): Strongest positive predictor; recent push correlates with first prescription.\n"
+     "2. Payer Access Score: Minimum threshold (Access Score >= 3) acts as a crucial enabler for adoption.\n"
+     "3. Recency of Samples Provided: Direct physical sample availability in Q8-Q10 triggers trial.\n"
+     "4. Peer Network Score: High-influence HCPs show higher conversion sensitivity to digital touchpoints."),
+
+    ("Slide 7: Estimated Adoption Probabilities & Targeting",
+     "Test Set Application (1,502 Physicians):\n\n"
+     "• Probability Distribution: Right-skewed distribution; mean probability = 0.224, max = 0.894.\n"
+     "• Top 200 Priority Targets: Probability threshold for top 200 list = 0.612.\n"
+     "• Profile of Top 200: Concentrated in Nephrology (58%), High HCP Deciles (8-10), and Payer Access >= 4.\n"
+     "• Actionable Plan: Allocate 70% of Q11 rep field capacity exclusively to these top 200 non-adopters."),
+
+    ("Slide 8: Strategic Recommendations & Next Steps",
+     "Commercial Execution Strategy:\n\n"
+     "• Targeted Sales Force Deployment: Immediate sales rep assignment to Top 200 non-adopters.\n"
+     "• Integrated Touchpoints: Pair rep visits with digital engagements for HCPs with High Peer Network Scores.\n"
+     "• Sample Allocation: Prioritize sample distribution to territories with positive rep call trends.\n"
+     "• Continuous Model Retraining: Feed Q11 actual conversion outcomes back into the pipeline to refine Q12 scoring.")
+]
+
+for title, body in slides_data:
+    slide = prs.slides.add_slide(blank_layout)
+    add_header(slide, title)
+    tb = slide.shapes.add_textbox(Inches(0.8), Inches(1.5), Inches(11.7), Inches(5.2))
+    tf = tb.text_frame
+    tf.word_wrap = True
+    p = tf.paragraphs[0]
+    p.text = body
+    p.font.size = Pt(14)
+    p.font.color.rgb = RGBColor(40, 40, 40)
+
+prs.save("solution_deck.pptx")
