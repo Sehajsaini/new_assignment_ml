@@ -1,0 +1,1645 @@
+# =============================================================================
+# ABC PHARMACEUTICALS - Q11 ADOPTION PROPENSITY PREDICTION
+# UPDATED END-TO-END LEAKAGE-SAFE MACHINE LEARNING PIPELINE
+# =============================================================================
+
+# =============================================================================
+# 1. IMPORT LIBRARIES
+# =============================================================================
+
+import warnings
+warnings.filterwarnings("ignore")
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from sklearn.model_selection import StratifiedKFold, GridSearchCV
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.impute import SimpleImputer
+
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
+
+from sklearn.metrics import (
+    roc_auc_score,
+    average_precision_score,
+    f1_score,
+    precision_score,
+    recall_score,
+    accuracy_score,
+    classification_report,
+    roc_curve
+)
+
+from sklearn.inspection import permutation_importance
+
+from xgboost import XGBClassifier
+
+
+# =============================================================================
+# 2. SETTINGS
+# =============================================================================
+
+RANDOM_STATE = 42
+np.random.seed(RANDOM_STATE)
+
+pd.set_option("display.max_columns", 100)
+pd.set_option("display.width", 150)
+
+
+# =============================================================================
+# 3. LOAD DATA
+# =============================================================================
+
+file1 = pd.read_csv("input_data_file1.csv")
+file2 = pd.read_csv("input_data_file2.csv")
+test_physicians = pd.read_csv("test_physicians.csv")
+
+print("=" * 80)
+print("DATASET SHAPES")
+print("=" * 80)
+
+print("Longitudinal data :", file1.shape)
+print("Physician data    :", file2.shape)
+print("Test physicians   :", test_physicians.shape)
+
+print("\nLONGITUDINAL COLUMNS:")
+print(file1.columns.tolist())
+
+print("\nSTATIC PHYSICIAN COLUMNS:")
+print(file2.columns.tolist())
+
+print("\nTEST COLUMNS:")
+print(test_physicians.columns.tolist())
+
+
+# =============================================================================
+# 4. BASIC DATA CLEANING
+# =============================================================================
+
+file1.columns = file1.columns.str.strip()
+file2.columns = file2.columns.str.strip()
+test_physicians.columns = test_physicians.columns.str.strip()
+
+file1 = file1.drop_duplicates().copy()
+file2 = file2.drop_duplicates().copy()
+test_physicians = test_physicians.drop_duplicates().copy()
+
+required_columns = [
+    "physician_id",
+    "quarter",
+    "rx_count"
+]
+
+missing_columns = [
+    col for col in required_columns
+    if col not in file1.columns
+]
+
+if missing_columns:
+    raise ValueError(
+        f"These required columns are missing from input_data_file1.csv: "
+        f"{missing_columns}"
+    )
+
+if "physician_id" not in file2.columns:
+    raise ValueError(
+        "physician_id is missing from input_data_file2.csv"
+    )
+
+if "physician_id" not in test_physicians.columns:
+    raise ValueError(
+        "physician_id is missing from test_physicians.csv"
+    )
+
+
+# =============================================================================
+# 5. CONVERT QUARTERS TO NUMERIC FORMAT
+# =============================================================================
+
+def quarter_to_number(value):
+    """
+    Converts values such as Q1, Q2, Q10 into integers.
+    """
+
+    value = str(value).strip().upper()
+
+    if value.startswith("Q"):
+        return int(value.replace("Q", ""))
+
+    return int(value)
+
+
+file1["quarter_num"] = file1["quarter"].apply(
+    quarter_to_number
+)
+
+file1 = file1.sort_values(
+    ["physician_id", "quarter_num"]
+).reset_index(drop=True)
+
+print("\nAVAILABLE QUARTERS:")
+print(sorted(file1["quarter_num"].unique()))
+
+print("\nUNIQUE PHYSICIANS:")
+print(file1["physician_id"].nunique())
+
+
+# =============================================================================
+# 6. EDA AND DATA QUALITY CHECK
+# =============================================================================
+
+print("\n" + "=" * 80)
+print("MISSING VALUES - LONGITUDINAL DATA")
+print("=" * 80)
+
+missing_file1 = file1.isnull().sum()
+print(
+    missing_file1[
+        missing_file1 > 0
+    ].sort_values(ascending=False)
+)
+
+print("\n" + "=" * 80)
+print("MISSING VALUES - STATIC DATA")
+print("=" * 80)
+
+missing_file2 = file2.isnull().sum()
+print(
+    missing_file2[
+        missing_file2 > 0
+    ].sort_values(ascending=False)
+)
+
+
+# =============================================================================
+# 7. IDENTIFY BEHAVIOURAL FEATURES
+# =============================================================================
+#
+# IMPORTANT:
+# rx_count is NOT used as a feature because it defines the adoption outcome.
+# This avoids direct target leakage.
+#
+# physician_id, quarter and quarter_num are identifiers/time variables.
+# =============================================================================
+
+excluded_columns = [
+    "physician_id",
+    "quarter",
+    "quarter_num",
+    "rx_count"
+]
+
+numeric_behavior_columns = [
+    column
+    for column in file1.select_dtypes(
+        include=np.number
+    ).columns
+    if column not in excluded_columns
+]
+
+print("\n" + "=" * 80)
+print("NUMERIC BEHAVIOURAL FEATURES USED")
+print("=" * 80)
+
+print(numeric_behavior_columns)
+
+
+# =============================================================================
+# 8. CHECK CLASS BALANCE BY QUARTER
+# =============================================================================
+
+quarter_adoption = (
+    file1.groupby("quarter_num")["rx_count"]
+    .apply(lambda x: (x > 0).mean())
+    .reset_index(name="adoption_rate")
+)
+
+print("\nADOPTION RATE BY QUARTER:")
+display(quarter_adoption.round(4))
+
+plt.figure(figsize=(9, 5))
+plt.plot(
+    quarter_adoption["quarter_num"],
+    quarter_adoption["adoption_rate"],
+    marker="o"
+)
+plt.xlabel("Quarter")
+plt.ylabel("Adoption Rate")
+plt.title("Drug Adoption Rate Across Quarters")
+plt.xticks(quarter_adoption["quarter_num"])
+plt.show()
+
+
+# =============================================================================
+# 9. HELPER FUNCTION - SAFE DIVISION
+# =============================================================================
+
+def safe_divide(numerator, denominator):
+    """
+    Prevents division by zero and infinity.
+    """
+
+    denominator = denominator.replace(0, np.nan)
+
+    result = numerator / denominator
+
+    return result.replace(
+        [np.inf, -np.inf],
+        np.nan
+    )
+
+
+# =============================================================================
+# 10. CREATE TEMPORAL FEATURES
+# =============================================================================
+#
+# For every physician at prediction quarter t:
+#
+# Features = information available from Q1 through Qt
+# Target   = adoption in Q(t+1)
+#
+# No future information is used in the features.
+# =============================================================================
+
+def create_temporal_features(
+    longitudinal_data,
+    static_data,
+    prediction_quarter,
+    numeric_columns
+):
+
+    history = longitudinal_data[
+        longitudinal_data["quarter_num"] <= prediction_quarter
+    ].copy()
+
+    history = history.sort_values(
+        ["physician_id", "quarter_num"]
+    )
+
+    physician_ids = history[
+        ["physician_id"]
+    ].drop_duplicates()
+
+    feature_data = physician_ids.copy()
+
+    # -------------------------------------------------------------------------
+    # A. HISTORICAL AVERAGES
+    # -------------------------------------------------------------------------
+
+    historical_means = (
+        history.groupby("physician_id")[
+            numeric_columns
+        ]
+        .mean()
+        .add_prefix("mean_")
+        .reset_index()
+    )
+
+    feature_data = feature_data.merge(
+        historical_means,
+        on="physician_id",
+        how="left"
+    )
+
+    # -------------------------------------------------------------------------
+    # B. HISTORICAL TOTALS
+    # -------------------------------------------------------------------------
+
+    historical_totals = (
+        history.groupby("physician_id")[
+            numeric_columns
+        ]
+        .sum()
+        .add_prefix("total_")
+        .reset_index()
+    )
+
+    feature_data = feature_data.merge(
+        historical_totals,
+        on="physician_id",
+        how="left"
+    )
+
+    # -------------------------------------------------------------------------
+    # C. RECENT 3-QUARTER AVERAGES
+    # -------------------------------------------------------------------------
+
+    recent_start = max(1, prediction_quarter - 2)
+
+    recent_history = history[
+        history["quarter_num"].between(
+            recent_start,
+            prediction_quarter
+        )
+    ]
+
+    recent_means = (
+        recent_history.groupby("physician_id")[
+            numeric_columns
+        ]
+        .mean()
+        .add_prefix("recent_mean_")
+        .reset_index()
+    )
+
+    feature_data = feature_data.merge(
+        recent_means,
+        on="physician_id",
+        how="left"
+    )
+
+    # -------------------------------------------------------------------------
+    # D. EARLIER VS RECENT CHANGE
+    # -------------------------------------------------------------------------
+
+    early_history = history[
+        history["quarter_num"] < recent_start
+    ]
+
+    if len(early_history) > 0:
+
+        early_means = (
+            early_history.groupby("physician_id")[
+                numeric_columns
+            ]
+            .mean()
+            .add_prefix("early_mean_")
+            .reset_index()
+        )
+
+        feature_data = feature_data.merge(
+            early_means,
+            on="physician_id",
+            how="left"
+        )
+
+        for column in numeric_columns:
+
+            recent_column = f"recent_mean_{column}"
+            early_column = f"early_mean_{column}"
+
+            if (
+                recent_column in feature_data.columns
+                and early_column in feature_data.columns
+            ):
+                feature_data[
+                    f"trend_{column}"
+                ] = (
+                    feature_data[recent_column]
+                    - feature_data[early_column]
+                )
+
+    # -------------------------------------------------------------------------
+    # E. MOST RECENT QUARTER VALUES
+    # -------------------------------------------------------------------------
+
+    latest_data = history[
+        history["quarter_num"] == prediction_quarter
+    ]
+
+    latest_columns = [
+        "physician_id"
+    ] + numeric_columns
+
+    latest_features = (
+        latest_data[latest_columns]
+        .copy()
+        .rename(
+            columns={
+                column: f"latest_{column}"
+                for column in numeric_columns
+            }
+        )
+    )
+
+    feature_data = feature_data.merge(
+        latest_features,
+        on="physician_id",
+        how="left"
+    )
+
+    # -------------------------------------------------------------------------
+    # F. RECENCY RATIOS
+    # -------------------------------------------------------------------------
+
+    for column in numeric_columns:
+
+        recent_column = f"recent_mean_{column}"
+        mean_column = f"mean_{column}"
+
+        if (
+            recent_column in feature_data.columns
+            and mean_column in feature_data.columns
+        ):
+            feature_data[
+                f"recent_ratio_{column}"
+            ] = safe_divide(
+                feature_data[recent_column],
+                feature_data[mean_column]
+            )
+
+    # -------------------------------------------------------------------------
+    # G. SLOPE / MOMENTUM FEATURES
+    # -------------------------------------------------------------------------
+
+    slope_records = []
+
+    for physician_id, group in history.groupby(
+        "physician_id"
+    ):
+
+        group = group.sort_values("quarter_num")
+
+        record = {
+            "physician_id": physician_id
+        }
+
+        for column in numeric_columns:
+
+            values = group[column].dropna().values
+
+            if len(values) >= 2:
+
+                x = np.arange(len(values))
+
+                record[f"slope_{column}"] = np.polyfit(
+                    x,
+                    values,
+                    1
+                )[0]
+
+            else:
+
+                record[f"slope_{column}"] = 0
+
+        slope_records.append(record)
+
+    slope_data = pd.DataFrame(slope_records)
+
+    feature_data = feature_data.merge(
+        slope_data,
+        on="physician_id",
+        how="left"
+    )
+
+    # -------------------------------------------------------------------------
+    # H. MERGE STATIC PHYSICIAN INFORMATION
+    # -------------------------------------------------------------------------
+
+    feature_data = feature_data.merge(
+        static_data,
+        on="physician_id",
+        how="left"
+    )
+
+    # -------------------------------------------------------------------------
+    # I. ADD PREDICTION QUARTER
+    # -------------------------------------------------------------------------
+
+    feature_data["prediction_quarter"] = prediction_quarter
+
+    return feature_data
+
+
+# =============================================================================
+# 11. CREATE ROLLING TRAINING DATASET
+# =============================================================================
+#
+# Example:
+# Features through Q3 -> target from Q4
+# Features through Q4 -> target from Q5
+# ...
+# Features through Q9 -> target from Q10
+#
+# This gives us a genuine historical simulation of future prediction.
+# =============================================================================
+
+max_quarter = file1["quarter_num"].max()
+
+training_records = []
+
+for prediction_quarter in range(3, max_quarter):
+
+    print(
+        f"Creating features through Q{prediction_quarter} "
+        f"for target Q{prediction_quarter + 1}"
+    )
+
+    features = create_temporal_features(
+        longitudinal_data=file1,
+        static_data=file2,
+        prediction_quarter=prediction_quarter,
+        numeric_columns=numeric_behavior_columns
+    )
+
+    next_quarter_target = file1[
+        file1["quarter_num"] == prediction_quarter + 1
+    ][
+        ["physician_id", "rx_count"]
+    ].copy()
+
+    next_quarter_target["target"] = (
+        next_quarter_target["rx_count"] > 0
+    ).astype(int)
+
+    next_quarter_target = next_quarter_target[
+        ["physician_id", "target"]
+    ]
+
+    period_data = features.merge(
+        next_quarter_target,
+        on="physician_id",
+        how="inner"
+    )
+
+    training_records.append(period_data)
+
+
+model_data = pd.concat(
+    training_records,
+    ignore_index=True
+)
+
+print("\n" + "=" * 80)
+print("ROLLING TRAINING DATASET")
+print("=" * 80)
+
+print("Shape:", model_data.shape)
+
+print("\nTarget Distribution:")
+print(
+    model_data["target"]
+    .value_counts()
+)
+
+print("\nTarget Proportion:")
+print(
+    model_data["target"]
+    .value_counts(normalize=True)
+    .round(4)
+)
+
+
+# =============================================================================
+# 12. TEMPORAL TRAIN / VALIDATION SPLIT
+# =============================================================================
+#
+# We do NOT randomly split physicians.
+#
+# Latest transition is held out for validation:
+# Q9 features -> Q10 adoption
+#
+# Earlier transitions are used for training.
+# =============================================================================
+
+validation_prediction_quarter = max_quarter - 1
+
+train_data = model_data[
+    model_data["prediction_quarter"]
+    < validation_prediction_quarter
+].copy()
+
+valid_data = model_data[
+    model_data["prediction_quarter"]
+    == validation_prediction_quarter
+].copy()
+
+print("\n" + "=" * 80)
+print("TEMPORAL SPLIT")
+print("=" * 80)
+
+print(
+    "Training feature periods:",
+    sorted(train_data["prediction_quarter"].unique())
+)
+
+print(
+    "Validation feature period:",
+    validation_prediction_quarter
+)
+
+print("Training rows:", len(train_data))
+print("Validation rows:", len(valid_data))
+
+
+# =============================================================================
+# 13. REMOVE IDENTIFIERS AND DEFINE X / y
+# =============================================================================
+
+drop_columns = [
+    "physician_id",
+    "target"
+]
+
+X_train = train_data.drop(
+    columns=drop_columns
+)
+
+y_train = train_data["target"].copy()
+
+X_valid = valid_data.drop(
+    columns=drop_columns
+)
+
+y_valid = valid_data["target"].copy()
+
+
+# Ensure identical columns
+X_valid = X_valid.reindex(
+    columns=X_train.columns
+)
+
+
+# =============================================================================
+# 14. REMOVE COMPLETELY EMPTY COLUMNS
+# =============================================================================
+
+all_null_columns = [
+    column
+    for column in X_train.columns
+    if X_train[column].isna().all()
+]
+
+X_train = X_train.drop(
+    columns=all_null_columns
+)
+
+X_valid = X_valid.drop(
+    columns=all_null_columns
+)
+
+print(
+    "\nNumber of model features:",
+    X_train.shape[1]
+)
+
+
+# =============================================================================
+# 15. IDENTIFY NUMERIC AND CATEGORICAL FEATURES
+# =============================================================================
+
+numeric_features = X_train.select_dtypes(
+    include=[
+        "number",
+        "bool"
+    ]
+).columns.tolist()
+
+categorical_features = [
+    column
+    for column in X_train.columns
+    if column not in numeric_features
+]
+
+print(
+    "Numeric features:",
+    len(numeric_features)
+)
+
+print(
+    "Categorical features:",
+    len(categorical_features)
+)
+
+
+# =============================================================================
+# 16. PREPROCESSING
+# =============================================================================
+
+numeric_transformer = Pipeline(
+    steps=[
+        (
+            "imputer",
+            SimpleImputer(strategy="median")
+        ),
+        (
+            "scaler",
+            StandardScaler()
+        )
+    ]
+)
+
+categorical_transformer = Pipeline(
+    steps=[
+        (
+            "imputer",
+            SimpleImputer(
+                strategy="most_frequent"
+            )
+        ),
+        (
+            "encoder",
+            OneHotEncoder(
+                handle_unknown="ignore"
+            )
+        )
+    ]
+)
+
+preprocessor = ColumnTransformer(
+    transformers=[
+        (
+            "numeric",
+            numeric_transformer,
+            numeric_features
+        ),
+        (
+            "categorical",
+            categorical_transformer,
+            categorical_features
+        )
+    ],
+    remainder="drop"
+)
+
+
+# =============================================================================
+# 17. CLASS IMBALANCE CALCULATION
+# =============================================================================
+
+negative_class = (
+    y_train == 0
+).sum()
+
+positive_class = (
+    y_train == 1
+).sum()
+
+scale_pos_weight = (
+    negative_class / positive_class
+)
+
+print("\n" + "=" * 80)
+print("CLASS IMBALANCE")
+print("=" * 80)
+
+print("Negative class:", negative_class)
+print("Positive class:", positive_class)
+
+print(
+    "scale_pos_weight:",
+    round(scale_pos_weight, 4)
+)
+
+
+# =============================================================================
+# 18. HELPER FUNCTION FOR MODEL EVALUATION
+# =============================================================================
+
+def evaluate_model(
+    model_name,
+    probabilities,
+    actual_values,
+    threshold=0.50
+):
+
+    predictions = (
+        probabilities >= threshold
+    ).astype(int)
+
+    results = {
+        "Model": model_name,
+        "AUC-ROC": roc_auc_score(
+            actual_values,
+            probabilities
+        ),
+        "PR-AUC": average_precision_score(
+            actual_values,
+            probabilities
+        ),
+        "F1-Score": f1_score(
+            actual_values,
+            predictions,
+            zero_division=0
+        ),
+        "Precision": precision_score(
+            actual_values,
+            predictions,
+            zero_division=0
+        ),
+        "Recall": recall_score(
+            actual_values,
+            predictions,
+            zero_division=0
+        ),
+        "Accuracy": accuracy_score(
+            actual_values,
+            predictions
+        )
+    }
+
+    return results
+
+
+# =============================================================================
+# 19. MODEL 1 - LOGISTIC REGRESSION
+# =============================================================================
+
+logistic_model = Pipeline(
+    steps=[
+        (
+            "preprocessor",
+            preprocessor
+        ),
+        (
+            "model",
+            LogisticRegression(
+                max_iter=3000,
+                class_weight="balanced",
+                C=1.0,
+                random_state=RANDOM_STATE
+            )
+        )
+    ]
+)
+
+logistic_model.fit(
+    X_train,
+    y_train
+)
+
+logistic_probabilities = (
+    logistic_model.predict_proba(X_valid)[:, 1]
+)
+
+logistic_results = evaluate_model(
+    "Logistic Regression",
+    logistic_probabilities,
+    y_valid
+)
+
+print("\n" + "=" * 80)
+print("LOGISTIC REGRESSION RESULTS")
+print("=" * 80)
+
+for metric, value in logistic_results.items():
+
+    if metric != "Model":
+        print(
+            f"{metric}: {value:.4f}"
+        )
+
+
+# =============================================================================
+# 20. MODEL 2 - RANDOM FOREST
+# =============================================================================
+
+rf_model = Pipeline(
+    steps=[
+        (
+            "preprocessor",
+            preprocessor
+        ),
+        (
+            "model",
+            RandomForestClassifier(
+                n_estimators=500,
+                max_depth=12,
+                min_samples_leaf=5,
+                max_features="sqrt",
+                class_weight="balanced",
+                n_jobs=-1,
+                random_state=RANDOM_STATE
+            )
+        )
+    ]
+)
+
+rf_model.fit(
+    X_train,
+    y_train
+)
+
+rf_probabilities = (
+    rf_model.predict_proba(X_valid)[:, 1]
+)
+
+rf_results = evaluate_model(
+    "Random Forest",
+    rf_probabilities,
+    y_valid
+)
+
+print("\n" + "=" * 80)
+print("RANDOM FOREST RESULTS")
+print("=" * 80)
+
+for metric, value in rf_results.items():
+
+    if metric != "Model":
+        print(
+            f"{metric}: {value:.4f}"
+        )
+
+
+# =============================================================================
+# 21. MODEL 3 - XGBOOST WITH CROSS-VALIDATION
+# =============================================================================
+#
+# XGBoost IS EXPLICITLY TRAINED HERE.
+#
+# scale_pos_weight handles class imbalance.
+# =============================================================================
+
+xgb_pipeline = Pipeline(
+    steps=[
+        (
+            "preprocessor",
+            preprocessor
+        ),
+        (
+            "model",
+            XGBClassifier(
+                objective="binary:logistic",
+                eval_metric="logloss",
+                random_state=RANDOM_STATE,
+                n_jobs=-1,
+                tree_method="hist",
+                scale_pos_weight=scale_pos_weight
+            )
+        )
+    ]
+)
+
+
+# Small and efficient parameter grid
+xgb_parameter_grid = {
+    "model__n_estimators": [
+        200,
+        300
+    ],
+    "model__max_depth": [
+        3,
+        5
+    ],
+    "model__learning_rate": [
+        0.03,
+        0.05
+    ],
+    "model__subsample": [
+        0.8
+    ],
+    "model__colsample_bytree": [
+        0.8
+    ],
+    "model__min_child_weight": [
+        1,
+        5
+    ]
+}
+
+
+cv = StratifiedKFold(
+    n_splits=4,
+    shuffle=True,
+    random_state=RANDOM_STATE
+)
+
+
+xgb_grid = GridSearchCV(
+    estimator=xgb_pipeline,
+    param_grid=xgb_parameter_grid,
+    scoring="roc_auc",
+    cv=cv,
+    n_jobs=-1,
+    verbose=1
+)
+
+
+print("\nTraining XGBoost with cross-validation...")
+
+xgb_grid.fit(
+    X_train,
+    y_train
+)
+
+best_xgb_model = xgb_grid.best_estimator_
+
+xgb_probabilities = (
+    best_xgb_model.predict_proba(
+        X_valid
+    )[:, 1]
+)
+
+xgb_results = evaluate_model(
+    "XGBoost",
+    xgb_probabilities,
+    y_valid
+)
+
+print("\n" + "=" * 80)
+print("XGBOOST RESULTS")
+print("=" * 80)
+
+print(
+    "Best Parameters:"
+)
+
+print(
+    xgb_grid.best_params_
+)
+
+print(
+    f"\nBest CV AUC: "
+    f"{xgb_grid.best_score_:.4f}"
+)
+
+print("\nValidation Metrics:")
+
+for metric, value in xgb_results.items():
+
+    if metric != "Model":
+        print(
+            f"{metric}: {value:.4f}"
+        )
+
+
+# =============================================================================
+# 22. FINAL MODEL COMPARISON
+# =============================================================================
+
+performance_table = pd.DataFrame(
+    [
+        logistic_results,
+        rf_results,
+        xgb_results
+    ]
+)
+
+performance_table = (
+    performance_table.sort_values(
+        "AUC-ROC",
+        ascending=False
+    )
+    .reset_index(drop=True)
+)
+
+print("\n" + "=" * 80)
+print("FINAL MODEL COMPARISON")
+print("=" * 80)
+
+# NO .style.format() - avoids the Jinja2 error
+display(
+    performance_table.round(4)
+)
+
+
+# =============================================================================
+# 23. ROC CURVE COMPARISON
+# =============================================================================
+
+plt.figure(figsize=(9, 6))
+
+probability_dict = {
+    "Logistic Regression":
+        logistic_probabilities,
+    "Random Forest":
+        rf_probabilities,
+    "XGBoost":
+        xgb_probabilities
+}
+
+for model_name, probabilities in probability_dict.items():
+
+    fpr, tpr, _ = roc_curve(
+        y_valid,
+        probabilities
+    )
+
+    auc_value = roc_auc_score(
+        y_valid,
+        probabilities
+    )
+
+    plt.plot(
+        fpr,
+        tpr,
+        label=(
+            f"{model_name} "
+            f"(AUC = {auc_value:.3f})"
+        )
+    )
+
+plt.plot(
+    [0, 1],
+    [0, 1],
+    linestyle="--"
+)
+
+plt.xlabel("False Positive Rate")
+plt.ylabel("True Positive Rate")
+plt.title("Temporal Validation - ROC Curve Comparison")
+plt.legend()
+plt.show()
+
+
+# =============================================================================
+# 24. SELECT BEST MODEL
+# =============================================================================
+
+model_objects = {
+    "Logistic Regression":
+        logistic_model,
+    "Random Forest":
+        rf_model,
+    "XGBoost":
+        best_xgb_model
+}
+
+probability_results = {
+    "Logistic Regression":
+        logistic_probabilities,
+    "Random Forest":
+        rf_probabilities,
+    "XGBoost":
+        xgb_probabilities
+}
+
+best_model_name = performance_table.iloc[
+    0
+]["Model"]
+
+best_model = model_objects[
+    best_model_name
+]
+
+best_validation_probabilities = probability_results[
+    best_model_name
+]
+
+print("\n" + "=" * 80)
+print("SELECTED MODEL")
+print("=" * 80)
+
+print(
+    "Best Model:",
+    best_model_name
+)
+
+
+# =============================================================================
+# 25. FIND BEST CLASSIFICATION THRESHOLD
+# =============================================================================
+#
+# AUC is threshold-independent and used for model selection.
+# F1 threshold is optimized separately on validation data.
+# =============================================================================
+
+threshold_results = []
+
+for threshold in np.arange(
+    0.10,
+    0.91,
+    0.01
+):
+
+    predictions = (
+        best_validation_probabilities >= threshold
+    ).astype(int)
+
+    threshold_results.append(
+        {
+            "threshold": threshold,
+            "f1_score": f1_score(
+                y_valid,
+                predictions,
+                zero_division=0
+            ),
+            "precision": precision_score(
+                y_valid,
+                predictions,
+                zero_division=0
+            ),
+            "recall": recall_score(
+                y_valid,
+                predictions,
+                zero_division=0
+            )
+        }
+    )
+
+threshold_table = pd.DataFrame(
+    threshold_results
+)
+
+best_threshold = threshold_table.loc[
+    threshold_table["f1_score"].idxmax(),
+    "threshold"
+]
+
+print(
+    "\nBest Validation Threshold:",
+    round(best_threshold, 2)
+)
+
+print("\nThreshold Results:")
+display(
+    threshold_table
+    .sort_values(
+        "f1_score",
+        ascending=False
+    )
+    .head(10)
+    .round(4)
+)
+
+
+# =============================================================================
+# 26. FINAL VALIDATION RESULTS USING BEST THRESHOLD
+# =============================================================================
+
+final_valid_predictions = (
+    best_validation_probabilities
+    >= best_threshold
+).astype(int)
+
+print("\n" + "=" * 80)
+print("FINAL VALIDATION CLASSIFICATION REPORT")
+print("=" * 80)
+
+print(
+    classification_report(
+        y_valid,
+        final_valid_predictions,
+        digits=4,
+        zero_division=0
+    )
+)
+
+
+# =============================================================================
+# 27. FEATURE IMPORTANCE
+# =============================================================================
+#
+# Permutation importance works regardless of which model wins.
+# =============================================================================
+
+print(
+    "\nCalculating permutation importance..."
+)
+
+permutation_results = permutation_importance(
+    best_model,
+    X_valid,
+    y_valid,
+    scoring="roc_auc",
+    n_repeats=5,
+    random_state=RANDOM_STATE,
+    n_jobs=-1
+)
+
+importance_df = pd.DataFrame(
+    {
+        "feature": X_valid.columns,
+        "importance":
+            permutation_results.importances_mean
+    }
+)
+
+importance_df = (
+    importance_df
+    .sort_values(
+        "importance",
+        ascending=False
+    )
+    .reset_index(drop=True)
+)
+
+print("\nTOP 20 FEATURE DRIVERS:")
+display(
+    importance_df.head(20).round(4)
+)
+
+
+# =============================================================================
+# 28. FEATURE IMPORTANCE PLOT
+# =============================================================================
+
+top_importance = importance_df.head(15)
+
+plt.figure(figsize=(10, 7))
+
+plt.barh(
+    top_importance["feature"][::-1],
+    top_importance["importance"][::-1]
+)
+
+plt.xlabel("Permutation Importance")
+plt.ylabel("Feature")
+plt.title(
+    f"Top 15 Adoption Drivers - {best_model_name}"
+)
+
+plt.show()
+
+
+# =============================================================================
+# 29. CREATE FINAL Q11 FEATURES
+# =============================================================================
+#
+# All information through Q10 is used.
+# No Q11 information is used.
+# =============================================================================
+
+print("\n" + "=" * 80)
+print("CREATING Q11 PREDICTION FEATURES")
+print("=" * 80)
+
+q11_features = create_temporal_features(
+    longitudinal_data=file1,
+    static_data=file2,
+    prediction_quarter=max_quarter,
+    numeric_columns=numeric_behavior_columns
+)
+
+
+# Keep only physicians requested in test file
+q11_features = q11_features.merge(
+    test_physicians[
+        ["physician_id"]
+    ].drop_duplicates(),
+    on="physician_id",
+    how="inner"
+)
+
+
+# =============================================================================
+# 30. ALIGN FINAL Q11 FEATURES WITH TRAINING FEATURES
+# =============================================================================
+
+X_final = q11_features.drop(
+    columns=["physician_id"]
+)
+
+# Add missing training columns if necessary
+for column in X_train.columns:
+
+    if column not in X_final.columns:
+        X_final[column] = np.nan
+
+# Remove additional columns and preserve exact order
+X_final = X_final.reindex(
+    columns=X_train.columns
+)
+
+print(
+    "Final Q11 feature shape:",
+    X_final.shape
+)
+
+
+# =============================================================================
+# 31. RETRAIN THE SELECTED MODEL ON ALL HISTORICAL TRANSITIONS
+# =============================================================================
+#
+# After model selection, retrain using all historical transition data.
+# =============================================================================
+
+X_all = model_data.drop(
+    columns=[
+        "physician_id",
+        "target"
+    ]
+)
+
+y_all = model_data["target"].copy()
+
+# Align columns
+X_all = X_all.reindex(
+    columns=X_train.columns
+)
+
+print(
+    "\nRetraining final model on all historical data..."
+)
+
+
+if best_model_name == "Logistic Regression":
+
+    final_model = Pipeline(
+        steps=[
+            (
+                "preprocessor",
+                preprocessor
+            ),
+            (
+                "model",
+                LogisticRegression(
+                    max_iter=3000,
+                    class_weight="balanced",
+                    C=1.0,
+                    random_state=RANDOM_STATE
+                )
+            )
+        ]
+    )
+
+
+elif best_model_name == "Random Forest":
+
+    final_model = Pipeline(
+        steps=[
+            (
+                "preprocessor",
+                preprocessor
+            ),
+            (
+                "model",
+                RandomForestClassifier(
+                    n_estimators=500,
+                    max_depth=12,
+                    min_samples_leaf=5,
+                    max_features="sqrt",
+                    class_weight="balanced",
+                    n_jobs=-1,
+                    random_state=RANDOM_STATE
+                )
+            )
+        ]
+    )
+
+
+else:
+
+    final_negative_class = (
+        y_all == 0
+    ).sum()
+
+    final_positive_class = (
+        y_all == 1
+    ).sum()
+
+    final_scale_pos_weight = (
+        final_negative_class
+        / final_positive_class
+    )
+
+    final_model = Pipeline(
+        steps=[
+            (
+                "preprocessor",
+                preprocessor
+            ),
+            (
+                "model",
+                XGBClassifier(
+                    objective="binary:logistic",
+                    eval_metric="logloss",
+                    random_state=RANDOM_STATE,
+                    n_jobs=-1,
+                    tree_method="hist",
+                    scale_pos_weight=final_scale_pos_weight,
+                    n_estimators=xgb_grid.best_params_[
+                        "model__n_estimators"
+                    ],
+                    max_depth=xgb_grid.best_params_[
+                        "model__max_depth"
+                    ],
+                    learning_rate=xgb_grid.best_params_[
+                        "model__learning_rate"
+                    ],
+                    subsample=xgb_grid.best_params_[
+                        "model__subsample"
+                    ],
+                    colsample_bytree=xgb_grid.best_params_[
+                        "model__colsample_bytree"
+                    ],
+                    min_child_weight=xgb_grid.best_params_[
+                        "model__min_child_weight"
+                    ]
+                )
+            )
+        ]
+    )
+
+
+final_model.fit(
+    X_all,
+    y_all
+)
+
+
+# =============================================================================
+# 32. GENERATE Q11 ADOPTION PROPENSITY
+# =============================================================================
+
+q11_probabilities = (
+    final_model.predict_proba(
+        X_final
+    )[:, 1]
+)
+
+q11_predictions = (
+    q11_probabilities >= best_threshold
+).astype(int)
+
+
+# =============================================================================
+# 33. CREATE FINAL PREDICTIONS
+# =============================================================================
+
+predictions = pd.DataFrame(
+    {
+        "physician_id":
+            q11_features["physician_id"].values,
+
+        "q11_adoption_probability":
+            q11_probabilities,
+
+        "q11_prediction":
+            q11_predictions
+    }
+)
+
+predictions = predictions.sort_values(
+    "q11_adoption_probability",
+    ascending=False
+).reset_index(drop=True)
+
+predictions["rank"] = (
+    np.arange(len(predictions)) + 1
+)
+
+predictions["priority_group"] = np.where(
+    predictions["rank"] <= 200,
+    "Top 200 - Primary Target",
+    "Other Physicians"
+)
+
+
+# =============================================================================
+# 34. DISPLAY TOP 20 PHYSICIANS
+# =============================================================================
+
+print("\n" + "=" * 80)
+print("TOP 20 Q11 ADOPTION TARGETS")
+print("=" * 80)
+
+display(
+    predictions.head(20).round(4)
+)
+
+
+# =============================================================================
+# 35. SAVE OUTPUT FILES
+# =============================================================================
+
+predictions.to_csv(
+    "predictions.csv",
+    index=False
+)
+
+top_200 = predictions.head(200).copy()
+
+top_200.to_csv(
+    "top_200_physicians.csv",
+    index=False
+)
+
+
+# =============================================================================
+# 36. FINAL SUMMARY
+# =============================================================================
+
+print("\n" + "=" * 80)
+print("FINAL PROJECT SUMMARY")
+print("=" * 80)
+
+print(
+    f"Selected Model: {best_model_name}"
+)
+
+print(
+    f"Validation AUC-ROC: "
+    f"{performance_table.iloc[0]['AUC-ROC']:.4f}"
+)
+
+print(
+    f"Validation PR-AUC: "
+    f"{performance_table.iloc[0]['PR-AUC']:.4f}"
+)
+
+print(
+    f"Selected Classification Threshold: "
+    f"{best_threshold:.2f}"
+)
+
+print(
+    f"Total Q11 Predictions: "
+    f"{len(predictions)}"
+)
+
+print(
+    f"Top Priority Physicians: "
+    f"{len(top_200)}"
+)
+
+print("\nFiles created successfully:")
+print("1. predictions.csv")
+print("2. top_200_physicians.csv")
+
+print("\nPipeline completed successfully.")
