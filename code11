@@ -1,0 +1,1795 @@
+# ============================================================
+# END-TO-END PHYSICIAN CLASSIFICATION PIPELINE
+# Corrected for train/test contamination and Arrow indexing errors
+# ============================================================
+#
+# IMPORTANT:
+# 1. Put your labelled training file and (if separate) unlabeled test file
+#    in DATA_DIR and set DATA_PATH / TEST_PATH below.
+# 2. The code converts Arrow/Parquet data to pandas immediately. This fixes:
+#       TypeError: only integer scalar arrays can be converted to a scalar index
+#    which occurs when a NumPy index array is applied directly to a PyArrow
+#    Table/ChunkedArray.
+# 3. Train/validation splitting happens BEFORE EDA, feature selection,
+#    correlation/VIF, scaling, imputation, SMOTE, KMeans, or model fitting.
+# 4. The final test set is NEVER used to fit preprocessing, feature engineering,
+#    SMOTE, KMeans, feature selection, or models.
+# 5. No rx_count-like outcome variable is used as a predictor if it is the
+#    target. Remove/rename any leakage columns in LEAKAGE_COLS as needed.
+#
+# The script is deliberately defensive about sklearn/xgboost/imbalanced-learn
+# version differences. XGBoost early_stopping_rounds is NOT passed to fit(),
+# avoiding the XGBoost API error seen in earlier versions.
+# ============================================================
+
+from __future__ import annotations
+
+import os
+import re
+import json
+import math
+import warnings
+from pathlib import Path
+from typing import Optional, List, Dict, Tuple
+
+warnings.filterwarnings("ignore")
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from sklearn.base import BaseEstimator, TransformerMixin, clone
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.impute import SimpleImputer
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.metrics import (
+    accuracy_score,
+    precision_score,
+    recall_score,
+    f1_score,
+    roc_auc_score,
+    average_precision_score,
+    balanced_accuracy_score,
+    matthews_corrcoef,
+    log_loss,
+    confusion_matrix,
+    classification_report,
+    roc_curve,
+    precision_recall_curve,
+)
+from sklearn.model_selection import (
+    GroupShuffleSplit,
+    StratifiedKFold,
+    StratifiedGroupKFold,
+)
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.feature_selection import mutual_info_classif
+from sklearn.inspection import permutation_importance
+from sklearn.cluster import KMeans
+
+# ------------------------------------------------------------
+# OPTIONAL LIBRARIES
+# ------------------------------------------------------------
+
+try:
+    from imblearn.combine import SMOTETomek
+    from imblearn.pipeline import Pipeline as ImbPipeline
+    IMBLEARN_AVAILABLE = True
+except Exception as e:
+    SMOTETOMEK_ERROR = str(e)
+    IMBLEARN_AVAILABLE = False
+
+try:
+    from xgboost import XGBClassifier
+    XGBOOST_AVAILABLE = True
+except Exception as e:
+    XGBOOST_ERROR = str(e)
+    XGBOOST_AVAILABLE = False
+
+# ------------------------------------------------------------
+# USER CONFIGURATION
+# ------------------------------------------------------------
+
+DATA_PATH = r"YOUR_LABELLED_DATA_FILE.csv"
+TEST_PATH = r""   # Leave blank if train + test are in one file.
+
+# If target is obvious, put its exact column name here.
+# Otherwise leave None and the script will try to detect it.
+TARGET_COL = None
+
+# Exact physician identifier / grouping column if known.
+# Examples: "physician_id", "subject_id", "hcp_id"
+GROUP_COL = None
+
+# Optional explicit test indicator in a single combined file.
+# Example: "is_test" where 1 means unlabeled test.
+TEST_FLAG_COL = None
+TEST_FLAG_VALUE = 1
+
+# Expected final test size from your problem statement.
+EXPECTED_TEST_SIZE = 1502
+
+RANDOM_STATE = 42
+N_SPLITS = 5
+VALIDATION_SIZE = 0.20
+
+# Do not use variables that directly reveal the outcome.
+# Add any known post-outcome variables here.
+LEAKAGE_COLS = [
+    "target",
+    "label",
+    "outcome",
+    "prediction",
+    "predicted",
+    "rx_count",       # remove this line if rx_count is genuinely a predictor
+]
+
+# Candidate target names. The first exact match is used.
+TARGET_CANDIDATES = [
+    "Q11",
+    "q11",
+    "Q11_target",
+    "q11_target",
+    "target",
+    "Target",
+    "label",
+    "Label",
+    "outcome",
+    "Outcome",
+    "y",
+    "Y",
+    "class",
+    "Class",
+    "adoption",
+    "adopted",
+]
+
+# Candidate grouping columns.
+GROUP_CANDIDATES = [
+    "physician_id",
+    "Physician_ID",
+    "physician",
+    "Physician",
+    "hcp_id",
+    "HCP_ID",
+    "subject_id",
+    "Subject_ID",
+    "subject",
+    "Subject",
+    "doctor_id",
+    "Doctor_ID",
+]
+
+OUTPUT_DIR = Path("model_outputs")
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+# ------------------------------------------------------------
+# HELPERS: ROBUST DATA LOADING
+# ------------------------------------------------------------
+
+def load_table(path: str) -> pd.DataFrame:
+    """
+    Load CSV/XLSX/XLS/Parquet/Feather/JSON and immediately materialize
+    Arrow-backed data into an ordinary pandas DataFrame.
+
+    This is the key correction for:
+        TypeError: only integer scalar arrays can be converted to a scalar index
+    """
+    if not path:
+        raise ValueError("DATA_PATH is empty. Set DATA_PATH to your labelled file.")
+
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"File not found: {p.resolve()}")
+
+    suffix = p.suffix.lower()
+
+    if suffix == ".csv":
+        df = pd.read_csv(p)
+    elif suffix in (".xlsx", ".xls"):
+        df = pd.read_excel(p)
+    elif suffix in (".parquet", ".pq"):
+        # pandas may use PyArrow here. Force a pandas materialization.
+        df = pd.read_parquet(p)
+    elif suffix == ".feather":
+        df = pd.read_feather(p)
+    elif suffix == ".json":
+        df = pd.read_json(p)
+    else:
+        raise ValueError(
+            f"Unsupported file type '{suffix}'. Use CSV, XLSX, XLS, Parquet, Feather or JSON."
+        )
+
+    # Force a normal pandas object and reset the index.
+    df = pd.DataFrame(df).copy()
+    df = df.reset_index(drop=True)
+
+    # Normalize duplicate column names.
+    df.columns = make_unique_columns([str(c).strip() for c in df.columns])
+
+    return df
+
+
+def make_unique_columns(cols: List[str]) -> List[str]:
+    seen = {}
+    out = []
+    for c in cols:
+        if c not in seen:
+            seen[c] = 0
+            out.append(c)
+        else:
+            seen[c] += 1
+            out.append(f"{c}__dup{seen[c]}")
+    return out
+
+
+def detect_column(df: pd.DataFrame, candidates: List[str], kind: str) -> Optional[str]:
+    lower_map = {str(c).strip().lower(): c for c in df.columns}
+    for c in candidates:
+        if c in df.columns:
+            return c
+        if c.lower() in lower_map:
+            return lower_map[c.lower()]
+    return None
+
+
+def detect_target(df: pd.DataFrame) -> str:
+    if TARGET_COL is not None:
+        if TARGET_COL not in df.columns:
+            raise KeyError(f"TARGET_COL='{TARGET_COL}' is not in the dataset.")
+        return TARGET_COL
+
+    detected = detect_column(df, TARGET_CANDIDATES, "target")
+    if detected is not None:
+        return detected
+
+    # Last-resort heuristic: a binary column with a target-like name.
+    for c in df.columns:
+        name = str(c).lower()
+        if any(k in name for k in ["target", "label", "outcome", "adopt", "class"]):
+            vals = pd.Series(df[c]).dropna().unique()
+            if len(vals) == 2:
+                return c
+
+    raise KeyError(
+        "Could not automatically identify the target. "
+        "Set TARGET_COL at the top of the script to the exact labelled outcome column."
+    )
+
+
+def detect_group(df: pd.DataFrame) -> Optional[str]:
+    if GROUP_COL is not None:
+        if GROUP_COL not in df.columns:
+            raise KeyError(f"GROUP_COL='{GROUP_COL}' is not in the dataset.")
+        return GROUP_COL
+    return detect_column(df, GROUP_CANDIDATES, "group")
+
+
+# ------------------------------------------------------------
+# SAFE TARGET ENCODING
+# ------------------------------------------------------------
+
+def encode_binary_target(y: pd.Series) -> Tuple[pd.Series, Dict]:
+    """
+    Convert common binary target representations to 0/1.
+    Does not infer from feature columns.
+    """
+    y = y.copy()
+
+    if y.isna().any():
+        raise ValueError("Target contains missing values in labelled data.")
+
+    vals = list(pd.unique(y))
+    if len(vals) != 2:
+        raise ValueError(
+            f"Expected a binary target but found {len(vals)} unique values: {vals[:20]}"
+        )
+
+    # Already numeric 0/1.
+    try:
+        numeric = pd.to_numeric(y, errors="raise")
+        u = sorted(pd.unique(numeric))
+        if set(u) == {0, 1}:
+            return numeric.astype(int), {"0": 0, "1": 1}
+    except Exception:
+        pass
+
+    # Common string labels.
+    normalized = y.astype(str).str.strip().str.lower()
+    positive_words = {
+        "1", "yes", "y", "true", "positive", "adopt", "adopted",
+        "narcolepsy", "case", "success", "high"
+    }
+    negative_words = {
+        "0", "no", "n", "false", "negative", "non-adopt", "not adopted",
+        "healthy", "control", "failure", "low"
+    }
+
+    mapping = {}
+    for original, norm in zip(vals, [str(v).strip().lower() for v in vals]):
+        if norm in positive_words:
+            mapping[original] = 1
+        elif norm in negative_words:
+            mapping[original] = 0
+
+    if len(mapping) == 2 and set(mapping.values()) == {0, 1}:
+        return y.map(mapping).astype(int), {str(k): int(v) for k, v in mapping.items()}
+
+    # Deterministic fallback for exactly two labels: preserve sorted order.
+    ordered = sorted(vals, key=lambda x: str(x))
+    fallback = {ordered[0]: 0, ordered[1]: 1}
+    return y.map(fallback).astype(int), {str(k): int(v) for k, v in fallback.items()}
+
+
+# ------------------------------------------------------------
+# SPLIT FIRST: THIS HAPPENS BEFORE EDA AND ALL FITTING
+# ------------------------------------------------------------
+
+def split_train_validation(
+    df_labelled: pd.DataFrame,
+    target_col: str,
+    group_col: Optional[str],
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Group-aware train/validation split.
+
+    IMPORTANT: the test set is not passed here.
+    """
+    df_labelled = df_labelled.reset_index(drop=True)
+
+    if group_col and group_col in df_labelled.columns:
+        splitter = GroupShuffleSplit(
+            n_splits=1,
+            test_size=VALIDATION_SIZE,
+            random_state=RANDOM_STATE,
+        )
+        train_idx, valid_idx = next(
+            splitter.split(
+                df_labelled,
+                df_labelled[target_col],
+                groups=df_labelled[group_col],
+            )
+        )
+    else:
+        # Fallback only when no group identifier exists.
+        # Stratification maintains class balance.
+        from sklearn.model_selection import train_test_split
+        train_idx, valid_idx = train_test_split(
+            np.arange(len(df_labelled)),
+            test_size=VALIDATION_SIZE,
+            random_state=RANDOM_STATE,
+            stratify=df_labelled[target_col],
+        )
+
+    # ALWAYS use .iloc on pandas.
+    train_df = df_labelled.iloc[np.asarray(train_idx, dtype=int)].copy().reset_index(drop=True)
+    valid_df = df_labelled.iloc[np.asarray(valid_idx, dtype=int)].copy().reset_index(drop=True)
+
+    return train_df, valid_df
+
+
+# ------------------------------------------------------------
+# SIMPLE EDA - RUN ONLY AFTER THE SPLIT
+# ------------------------------------------------------------
+
+def run_simple_eda(train_df: pd.DataFrame, target_col: str, group_col: Optional[str]) -> None:
+    print("\n" + "=" * 90)
+    print("EDA — TRAINING PART ONLY")
+    print("=" * 90)
+
+    print("\nShape:", train_df.shape)
+    print("\nTarget distribution:")
+    print(train_df[target_col].value_counts(dropna=False))
+    print("\nTarget proportions:")
+    print(train_df[target_col].value_counts(normalize=True, dropna=False))
+
+    missing = (
+        train_df.isna()
+        .sum()
+        .sort_values(ascending=False)
+        .rename("missing_count")
+        .to_frame()
+    )
+    missing["missing_pct"] = 100 * missing["missing_count"] / len(train_df)
+    print("\nTop missing-value columns:")
+    print(missing.head(20))
+
+    numeric = train_df.select_dtypes(include=np.number)
+    if not numeric.empty:
+        print("\nNumeric summary:")
+        print(numeric.describe().T.head(30))
+
+    categorical = train_df.select_dtypes(exclude=np.number)
+    print("\nNumber of categorical columns:", categorical.shape[1])
+
+    if group_col and group_col in train_df.columns:
+        print("\nUnique groups in training:", train_df[group_col].nunique())
+
+    # Simple target-vs-numeric analysis using training data only.
+    if not numeric.empty:
+        correlations = []
+        y = train_df[target_col]
+        for c in numeric.columns:
+            if c == target_col:
+                continue
+            x = pd.to_numeric(train_df[c], errors="coerce")
+            if x.notna().sum() >= 10 and x.nunique(dropna=True) > 1:
+                try:
+                    corr = x.corr(pd.to_numeric(y, errors="coerce"))
+                    correlations.append((c, corr))
+                except Exception:
+                    pass
+        if correlations:
+            corr_df = pd.DataFrame(correlations, columns=["feature", "target_corr"])
+            corr_df["abs_corr"] = corr_df["target_corr"].abs()
+            print("\nTop numeric associations with target:")
+            print(corr_df.sort_values("abs_corr", ascending=False).head(20))
+
+    # Simple plots. No test data is shown.
+    try:
+        plt.figure(figsize=(6, 4))
+        train_df[target_col].value_counts().sort_index().plot(kind="bar")
+        plt.title("Training Target Distribution")
+        plt.xlabel("Class")
+        plt.ylabel("Count")
+        plt.tight_layout()
+        plt.savefig(OUTPUT_DIR / "eda_target_distribution.png", dpi=160)
+        plt.close()
+    except Exception as e:
+        print("EDA plot warning:", e)
+
+
+# ------------------------------------------------------------
+# FEATURE ENGINEERING
+# ------------------------------------------------------------
+
+def _numeric_series(df: pd.DataFrame, col: str) -> Optional[pd.Series]:
+    if col not in df.columns:
+        return None
+    s = pd.to_numeric(df[col], errors="coerce")
+    if s.notna().sum() == 0:
+        return None
+    return s
+
+
+def _find_q_columns(df: pd.DataFrame, base_patterns: List[str], periods: List[int]) -> Dict[int, str]:
+    """
+    Find columns such as Q7, Q8, Q9, Q10 or rx_Q7/rx_Q8/etc.
+    """
+    result = {}
+    cols = list(df.columns)
+
+    for p in periods:
+        candidates = []
+        for c in cols:
+            cl = str(c).strip().lower()
+            for base in base_patterns:
+                b = base.lower()
+                patterns = [
+                    rf"^{re.escape(b)}[_\-\s]*q{p}$",
+                    rf"^{re.escape(b)}[_\-\s]*{p}$",
+                    rf"^q{p}[_\-\s]*{re.escape(b)}$",
+                    rf"^{re.escape(b)}[_\-\s]*quarter[_\-\s]*{p}$",
+                ]
+                if any(re.search(pt, cl) for pt in patterns):
+                    candidates.append(c)
+        if candidates:
+            result[p] = candidates[0]
+
+    # Generic Q7/Q8/Q9/Q10 if no base pattern matched.
+    for p in periods:
+        if p in result:
+            continue
+        exact = [c for c in cols if str(c).strip().lower() in {f"q{p}", str(p)}]
+        if exact:
+            result[p] = exact[0]
+
+    return result
+
+
+def add_momentum_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Momentum features over Q7-Q10.
+
+    The formula is:
+        momentum_Q10_Q7 = Q10 - Q7
+        recent_momentum = mean(Q9,Q10) - mean(Q7,Q8)
+        momentum_acceleration = (Q10-Q9) - (Q8-Q7)
+        slope_Q7_Q10 = linear slope across available periods
+
+    These are feature-only calculations. They do not use the target.
+    """
+    out = df.copy()
+
+    periods = [7, 8, 9, 10]
+
+    # Try generic names first.
+    patterns = [
+        ["rx", "rxcount", "rx_count", "prescription", "prescriptions"],
+        ["adoption", "adopt"],
+        ["sales", "volume"],
+        ["count"],
+    ]
+
+    series_map = None
+    for bases in patterns:
+        found = _find_q_columns(out, bases, periods)
+        if len(found) >= 3:
+            series_map = found
+            break
+
+    if series_map is None:
+        found = {}
+        for p in periods:
+            # columns containing q7/q8/etc and likely activity/count terms
+            candidates = [
+                c for c in out.columns
+                if re.search(rf"(^|[_\-\s])q{p}($|[_\-\s])", str(c).lower())
+            ]
+            if candidates:
+                # Prefer numeric candidate.
+                numeric_candidates = [
+                    c for c in candidates
+                    if pd.api.types.is_numeric_dtype(out[c])
+                ]
+                found[p] = numeric_candidates[0] if numeric_candidates else candidates[0]
+        if len(found) >= 3:
+            series_map = found
+
+    if series_map is None:
+        print("\nMomentum feature note: Q7-Q10 longitudinal columns were not detected;")
+        print("the script continues without fabricating a momentum variable.")
+        return out
+
+    q = {}
+    for p, c in series_map.items():
+        q[p] = pd.to_numeric(out[c], errors="coerce")
+
+    def safe_mean(items):
+        return pd.concat(items, axis=1).mean(axis=1)
+
+    if 7 in q and 10 in q:
+        out["momentum_Q10_minus_Q7"] = q[10] - q[7]
+
+    if 7 in q and 8 in q and 9 in q and 10 in q:
+        early = safe_mean([q[7], q[8]])
+        late = safe_mean([q[9], q[10]])
+        out["recent_momentum"] = late - early
+        out["momentum_acceleration"] = (q[10] - q[9]) - (q[8] - q[7])
+        x = np.array([7.0, 8.0, 9.0, 10.0])
+
+        values = pd.concat([q[7], q[8], q[9], q[10]], axis=1).to_numpy(dtype=float)
+        slopes = np.full(len(values), np.nan)
+        for i, row in enumerate(values):
+            mask = np.isfinite(row)
+            if mask.sum() >= 2:
+                slopes[i] = np.polyfit(x[mask], row[mask], 1)[0]
+        out["momentum_slope_Q7_Q10"] = slopes
+
+    if 9 in q and 10 in q:
+        out["Q10_vs_Q9_change"] = q[10] - q[9]
+        denominator = q[9].abs().replace(0, np.nan)
+        out["Q10_vs_Q9_growth_rate"] = (q[10] - q[9]) / denominator
+
+    return out
+
+
+def advanced_feature_engineering(
+    df: pd.DataFrame,
+    target_col: str,
+    group_col: Optional[str],
+) -> pd.DataFrame:
+    """
+    Feature engineering uses only columns in the current dataframe.
+    No target-derived feature is created.
+
+    Because this transformation is deterministic and does not learn from
+    other rows, it is safe to apply separately to train/validation/test.
+    """
+    out = df.copy()
+
+    # Remove target from feature engineering calculations.
+    feature_cols = [c for c in out.columns if c != target_col]
+
+    numeric_cols = [
+        c for c in feature_cols
+        if pd.api.types.is_numeric_dtype(out[c])
+    ]
+
+    # Remove obvious IDs from aggregate calculations.
+    numeric_signal_cols = [
+        c for c in numeric_cols
+        if not any(token in str(c).lower() for token in ["id", "zip", "zipcode", "pincode"])
+    ]
+
+    # Row-wise robust aggregate features.
+    if numeric_signal_cols:
+        Xn = out[numeric_signal_cols].apply(pd.to_numeric, errors="coerce")
+        out["feature_numeric_count"] = Xn.notna().sum(axis=1)
+        out["feature_numeric_mean"] = Xn.mean(axis=1)
+        out["feature_numeric_std"] = Xn.std(axis=1)
+        out["feature_numeric_min"] = Xn.min(axis=1)
+        out["feature_numeric_max"] = Xn.max(axis=1)
+
+    # Common ratio features when the columns exist.
+    def ratio(new_name, numerator_candidates, denominator_candidates):
+        num_col = detect_column(out, numerator_candidates, "numerator")
+        den_col = detect_column(out, denominator_candidates, "denominator")
+        if num_col and den_col:
+            num = pd.to_numeric(out[num_col], errors="coerce")
+            den = pd.to_numeric(out[den_col], errors="coerce").replace(0, np.nan)
+            out[new_name] = num / den
+
+    ratio(
+        "processing_fee_rate",
+        ["processing_fee"],
+        ["loan_amount", "sanction_amount"],
+    )
+    ratio(
+        "gst_rate",
+        ["gst"],
+        ["processing_fee", "loan_amount"],
+    )
+    ratio(
+        "net_disbursement_rate",
+        ["net_disbursement"],
+        ["loan_amount", "sanction_amount"],
+    )
+    ratio(
+        "dpd_per_delinquent_month",
+        ["total_dpd"],
+        ["delinquent_months"],
+    )
+    ratio(
+        "closed_to_open_account_ratio",
+        ["number_of_closed_accounts"],
+        ["number_of_open_accounts"],
+    )
+    ratio(
+        "dependants_per_open_account",
+        ["number_of_dependants"],
+        ["number_of_open_accounts"],
+    )
+
+    # Tenure/address stability style features.
+    if "years_at_current_address" in out.columns and "age" in out.columns:
+        age = pd.to_numeric(out["age"], errors="coerce")
+        years = pd.to_numeric(out["years_at_current_address"], errors="coerce")
+        out["address_stability_ratio"] = years / age.replace(0, np.nan)
+
+    # Credit pressure.
+    if "credit_utilization_ratio" in out.columns:
+        cur = pd.to_numeric(out["credit_utilization_ratio"], errors="coerce")
+        out["credit_utilization_sq"] = cur ** 2
+        out["credit_utilization_log"] = np.log1p(cur.clip(lower=0))
+
+    # Enquiry intensity relative to open accounts.
+    ratio(
+        "enquiry_per_open_account",
+        ["enquiry_count"],
+        ["number_of_open_accounts"],
+    )
+
+    # DPD risk transform.
+    if "total_dpd" in out.columns:
+        dpd = pd.to_numeric(out["total_dpd"], errors="coerce")
+        out["total_dpd_log1p"] = np.log1p(dpd.clip(lower=0))
+        out["any_dpd_flag"] = (dpd.fillna(0) > 0).astype(int)
+
+    # Loan amount transforms.
+    for c in ["loan_amount", "sanction_amount", "principal_outstanding", "bank_balance_at_application"]:
+        if c in out.columns:
+            s = pd.to_numeric(out[c], errors="coerce")
+            out[f"{c}_log1p"] = np.log1p(s.clip(lower=0))
+
+    # --------------------------------------------------------
+    # Longitudinal momentum — explicitly requested
+    # --------------------------------------------------------
+    out = add_momentum_features(out)
+
+    # General Q7-Q10 longitudinal aggregates.
+    q_periods = {}
+    for p in [7, 8, 9, 10]:
+        candidates = [
+            c for c in out.columns
+            if re.search(rf"(^|[_\-\s])q{p}($|[_\-\s])", str(c).lower())
+        ]
+        if candidates:
+            numeric_candidates = [
+                c for c in candidates
+                if pd.api.types.is_numeric_dtype(out[c])
+            ]
+            if numeric_candidates:
+                q_periods[p] = numeric_candidates[0]
+
+    if len(q_periods) >= 3:
+        qmat = pd.concat(
+            [pd.to_numeric(out[c], errors="coerce") for c in q_periods.values()],
+            axis=1,
+        )
+        out["Q7_Q10_activity_mean"] = qmat.mean(axis=1)
+        out["Q7_Q10_activity_std"] = qmat.std(axis=1)
+        out["Q7_Q10_activity_max"] = qmat.max(axis=1)
+        out["Q7_Q10_activity_min"] = qmat.min(axis=1)
+
+    # Group-size feature is unsupervised and safe.
+    if group_col and group_col in out.columns:
+        counts = out[group_col].value_counts(dropna=False)
+        out["group_observation_count"] = out[group_col].map(counts).astype(float)
+
+    # Clean infinities.
+    out = out.replace([np.inf, -np.inf], np.nan)
+
+    return out
+
+
+# ------------------------------------------------------------
+# CORRELATION + VIF — TRAINING DATA ONLY
+# ------------------------------------------------------------
+
+def run_correlation_and_vif(train_features: pd.DataFrame, target_col: str) -> None:
+    print("\n" + "=" * 90)
+    print("CORRELATION + VIF — TRAINING DATA ONLY")
+    print("=" * 90)
+
+    numeric = train_features.select_dtypes(include=np.number).copy()
+    if target_col in numeric.columns:
+        numeric = numeric.drop(columns=[target_col])
+
+    if numeric.shape[1] == 0:
+        print("No numeric features available.")
+        return
+
+    # Remove all-constant columns.
+    numeric = numeric.loc[:, numeric.nunique(dropna=True) > 1]
+
+    corr = numeric.corr(numeric_only=True)
+    corr.to_csv(OUTPUT_DIR / "training_correlation_matrix.csv")
+
+    try:
+        plt.figure(figsize=(10, 8))
+        plt.imshow(corr.fillna(0).to_numpy(), aspect="auto")
+        plt.colorbar()
+        plt.title("Training Numeric Feature Correlation")
+        plt.tight_layout()
+        plt.savefig(OUTPUT_DIR / "training_correlation_matrix.png", dpi=160)
+        plt.close()
+    except Exception as e:
+        print("Correlation plot warning:", e)
+
+    # VIF requires statsmodels. Use a bounded set to avoid enormous matrices.
+    try:
+        from statsmodels.stats.outliers_influence import variance_inflation_factor
+
+        vif_df = numeric.copy()
+        # Median imputation only for this descriptive diagnostic.
+        vif_df = vif_df.replace([np.inf, -np.inf], np.nan)
+        vif_df = vif_df.fillna(vif_df.median(numeric_only=True))
+        vif_df = vif_df.loc[:, vif_df.nunique(dropna=True) > 1]
+
+        # Avoid singular/huge matrices.
+        if vif_df.shape[1] > 80:
+            variances = vif_df.var().sort_values(ascending=False)
+            vif_df = vif_df[variances.head(80).index]
+
+        vals = vif_df.to_numpy(dtype=float)
+        rows = []
+        for i, c in enumerate(vif_df.columns):
+            try:
+                v = variance_inflation_factor(vals, i)
+            except Exception:
+                v = np.inf
+            rows.append((c, v))
+
+        out = pd.DataFrame(rows, columns=["feature", "VIF"])
+        out.sort_values("VIF", ascending=False).to_csv(
+            OUTPUT_DIR / "training_vif.csv", index=False
+        )
+        print("\nTop VIF values:")
+        print(out.head(20))
+    except Exception as e:
+        print("VIF diagnostic skipped:", e)
+
+
+# ------------------------------------------------------------
+# K-MEANS TRANSFORMER — FITS ONLY INSIDE EACH TRAINING FOLD
+# ------------------------------------------------------------
+
+class SafeKMeansFeatures(BaseEstimator, TransformerMixin):
+    """
+    Adds KMeans cluster one-hot features from numeric inputs.
+
+    It is a transformer so it is fitted only on each training fold when
+    used inside the sklearn pipeline. Therefore KMeans does not leak
+    validation/test information.
+    """
+    def __init__(self, n_clusters=4, random_state=42):
+        self.n_clusters = n_clusters
+        self.random_state = random_state
+
+    def fit(self, X, y=None):
+        X_arr = self._to_numeric_array(X)
+        self.medians_ = np.nanmedian(X_arr, axis=0)
+        self.medians_[~np.isfinite(self.medians_)] = 0.0
+        X_imp = np.where(np.isfinite(X_arr), X_arr, self.medians_)
+
+        # Standardize for distance.
+        self.means_ = np.nanmean(X_imp, axis=0)
+        self.stds_ = np.nanstd(X_imp, axis=0)
+        self.stds_[self.stds_ == 0] = 1.0
+        Z = (X_imp - self.means_) / self.stds_
+
+        n_clusters = max(2, min(int(self.n_clusters), max(2, len(Z))))
+        self.kmeans_ = KMeans(
+            n_clusters=n_clusters,
+            random_state=self.random_state,
+            n_init=10,
+        )
+        self.kmeans_.fit(Z)
+        return self
+
+    def transform(self, X):
+        X_arr = self._to_numeric_array(X)
+        X_imp = np.where(np.isfinite(X_arr), X_arr, self.medians_)
+        Z = (X_imp - self.means_) / self.stds_
+        labels = self.kmeans_.predict(Z)
+        one_hot = np.zeros((len(labels), self.kmeans_.n_clusters), dtype=float)
+        one_hot[np.arange(len(labels)), labels] = 1.0
+        return one_hot
+
+    @staticmethod
+    def _to_numeric_array(X):
+        if isinstance(X, pd.DataFrame):
+            arr = X.to_numpy(dtype=float)
+        else:
+            arr = np.asarray(X, dtype=float)
+        if arr.ndim == 1:
+            arr = arr.reshape(-1, 1)
+        return arr
+
+
+# ------------------------------------------------------------
+# PREPROCESSOR
+# ------------------------------------------------------------
+
+def make_one_hot_encoder():
+    # sklearn >= 1.2 uses sparse_output.
+    try:
+        return OneHotEncoder(handle_unknown="ignore", sparse_output=True)
+    except TypeError:
+        return OneHotEncoder(handle_unknown="ignore", sparse=True)
+
+
+def build_preprocessor(X: pd.DataFrame):
+    numeric_cols = X.select_dtypes(include=np.number).columns.tolist()
+    categorical_cols = [
+        c for c in X.columns
+        if c not in numeric_cols
+    ]
+
+    # IDs should not normally be one-hot encoded.
+    categorical_cols = [
+        c for c in categorical_cols
+        if not any(token in str(c).lower() for token in ["id", "identifier"])
+    ]
+
+    numeric_pipe = Pipeline([
+        ("imputer", SimpleImputer(strategy="median")),
+        ("scaler", StandardScaler()),
+    ])
+
+    categorical_pipe = Pipeline([
+        ("imputer", SimpleImputer(strategy="most_frequent")),
+        ("onehot", make_one_hot_encoder()),
+    ])
+
+    transformers = []
+    if numeric_cols:
+        transformers.append(("num", numeric_pipe, numeric_cols))
+    if categorical_cols:
+        transformers.append(("cat", categorical_pipe, categorical_cols))
+
+    if not transformers:
+        raise ValueError("No usable feature columns were found.")
+
+    preprocessor = ColumnTransformer(
+        transformers=transformers,
+        remainder="drop",
+    )
+    return preprocessor
+
+
+# ------------------------------------------------------------
+# MODELS
+# ------------------------------------------------------------
+
+def build_models(preprocessor):
+    models = {}
+
+    models["Logistic Regression"] = LogisticRegression(
+        max_iter=3000,
+        class_weight="balanced",
+        solver="liblinear",
+        random_state=RANDOM_STATE,
+    )
+
+    models["Random Forest"] = RandomForestClassifier(
+        n_estimators=500,
+        max_depth=None,
+        min_samples_leaf=2,
+        max_features="sqrt",
+        class_weight="balanced_subsample",
+        n_jobs=-1,
+        random_state=RANDOM_STATE,
+        oob_score=True,
+        bootstrap=True,
+    )
+
+    models["Gradient Boosting"] = GradientBoostingClassifier(
+        n_estimators=250,
+        learning_rate=0.03,
+        max_depth=3,
+        min_samples_leaf=5,
+        subsample=0.85,
+        random_state=RANDOM_STATE,
+    )
+
+    if XGBOOST_AVAILABLE:
+        # Do NOT pass early_stopping_rounds to fit().
+        models["XGBoost"] = XGBClassifier(
+            n_estimators=500,
+            max_depth=5,
+            learning_rate=0.03,
+            subsample=0.85,
+            colsample_bytree=0.85,
+            min_child_weight=3,
+            gamma=0.0,
+            reg_alpha=0.1,
+            reg_lambda=2.0,
+            objective="binary:logistic",
+            eval_metric="logloss",
+            tree_method="hist",
+            n_jobs=-1,
+            random_state=RANDOM_STATE,
+        )
+    else:
+        print("\nXGBoost unavailable; continuing with LR, RF and Gradient Boosting.")
+        print("XGBoost import error:", XGBOOST_ERROR)
+
+    pipelines = {}
+    for name, estimator in models.items():
+        if IMBLEARN_AVAILABLE:
+            # SMOTETomek occurs AFTER preprocessing and is fitted separately
+            # inside each CV fold.
+            pipelines[name] = ImbPipeline([
+                ("preprocess", preprocessor),
+                ("balance", SMOTETomek(random_state=RANDOM_STATE)),
+                ("model", estimator),
+            ])
+        else:
+            pipelines[name] = Pipeline([
+                ("preprocess", preprocessor),
+                ("model", estimator),
+            ])
+
+    return pipelines
+
+
+# ------------------------------------------------------------
+# GROUP-AWARE CV
+# ------------------------------------------------------------
+
+def get_cv_splits(
+    X: pd.DataFrame,
+    y: pd.Series,
+    group_col: Optional[str],
+):
+    """
+    Prefer StratifiedGroupKFold when group information exists.
+    Otherwise use StratifiedKFold.
+
+    The group column is removed from model predictors separately.
+    """
+    if group_col and group_col in X.columns:
+        try:
+            cv = StratifiedGroupKFold(
+                n_splits=N_SPLITS,
+                shuffle=True,
+                random_state=RANDOM_STATE,
+            )
+            groups = X[group_col].to_numpy()
+            dummy_X = X.drop(columns=[group_col])
+            splits = list(cv.split(dummy_X, y, groups=groups))
+            return splits, "StratifiedGroupKFold"
+        except Exception as e:
+            print("StratifiedGroupKFold unavailable; using GroupKFold-style split:", e)
+            from sklearn.model_selection import GroupKFold
+            cv = GroupKFold(n_splits=N_SPLITS)
+            groups = X[group_col].to_numpy()
+            dummy_X = X.drop(columns=[group_col])
+            splits = list(cv.split(dummy_X, y, groups=groups))
+            return splits, "GroupKFold"
+
+    cv = StratifiedKFold(
+        n_splits=N_SPLITS,
+        shuffle=True,
+        random_state=RANDOM_STATE,
+    )
+    splits = list(cv.split(X, y))
+    return splits, "StratifiedKFold"
+
+
+# ------------------------------------------------------------
+# METRICS
+# ------------------------------------------------------------
+
+def specificity_score(y_true, y_pred):
+    cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
+    tn, fp, fn, tp = cm.ravel()
+    return tn / (tn + fp) if (tn + fp) else np.nan
+
+
+def evaluate_binary(y_true, prob, threshold=0.50) -> Dict:
+    prob = np.asarray(prob, dtype=float)
+    pred = (prob >= threshold).astype(int)
+
+    result = {
+        "accuracy": accuracy_score(y_true, pred),
+        "precision": precision_score(y_true, pred, zero_division=0),
+        "recall": recall_score(y_true, pred, zero_division=0),
+        "specificity": specificity_score(y_true, pred),
+        "f1": f1_score(y_true, pred, zero_division=0),
+        "balanced_accuracy": balanced_accuracy_score(y_true, pred),
+        "mcc": matthews_corrcoef(y_true, pred),
+        "roc_auc": np.nan,
+        "pr_auc": np.nan,
+        "log_loss": np.nan,
+    }
+
+    try:
+        result["roc_auc"] = roc_auc_score(y_true, prob)
+    except Exception:
+        pass
+
+    try:
+        result["pr_auc"] = average_precision_score(y_true, prob)
+    except Exception:
+        pass
+
+    try:
+        result["log_loss"] = log_loss(y_true, np.column_stack([1-prob, prob]))
+    except Exception:
+        pass
+
+    return result
+
+
+# ------------------------------------------------------------
+# CROSS-VALIDATION
+# ------------------------------------------------------------
+
+def cross_validate_models(
+    X: pd.DataFrame,
+    y: pd.Series,
+    group_col: Optional[str],
+):
+    """
+    Fit every model from scratch in every fold.
+
+    No preprocessing, SMOTE, KMeans, scaling or model fitting is performed
+    on the held-out fold.
+    """
+    print("\n" + "=" * 90)
+    print("CROSS-VALIDATION")
+    print("=" * 90)
+
+    model_X = X.drop(columns=[group_col], errors="ignore").copy()
+
+    preprocessor = build_preprocessor(model_X)
+    pipelines = build_models(preprocessor)
+
+    splits, cv_name = get_cv_splits(X, y, group_col)
+    print(f"CV strategy: {cv_name}")
+    print(f"Number of folds: {len(splits)}")
+
+    all_rows = []
+    oof_probabilities = {}
+    oof_truth = {}
+
+    for model_name, pipe in pipelines.items():
+        print(f"\n>>> {model_name}")
+
+        oof = np.full(len(X), np.nan)
+
+        for fold, (tr_idx, va_idx) in enumerate(splits, start=1):
+            tr_idx = np.asarray(tr_idx, dtype=int)
+            va_idx = np.asarray(va_idx, dtype=int)
+
+            # IMPORTANT: .iloc, never X[np_array] if X might be Arrow-backed.
+            Xtr = model_X.iloc[tr_idx].copy()
+            Xva = model_X.iloc[va_idx].copy()
+            ytr = np.asarray(y.iloc[tr_idx], dtype=int)
+            yva = np.asarray(y.iloc[va_idx], dtype=int)
+
+            fitted = clone(pipe)
+            fitted.fit(Xtr, ytr)
+
+            prob = fitted.predict_proba(Xva)[:, 1]
+            oof[va_idx] = prob
+
+            m = evaluate_binary(yva, prob, threshold=0.50)
+            m.update({
+                "model": model_name,
+                "fold": fold,
+                "n_train": len(tr_idx),
+                "n_valid": len(va_idx),
+            })
+            all_rows.append(m)
+
+            print(
+                f"Fold {fold}: "
+                f"ROC-AUC={m['roc_auc']:.4f}, "
+                f"PR-AUC={m['pr_auc']:.4f}, "
+                f"Recall={m['recall']:.4f}, "
+                f"Specificity={m['specificity']:.4f}, "
+                f"F1={m['f1']:.4f}"
+            )
+
+        oof_probabilities[model_name] = oof
+        oof_truth[model_name] = np.asarray(y, dtype=int)
+
+        overall = evaluate_binary(y, oof, threshold=0.50)
+        overall["model"] = model_name
+        overall["fold"] = "OOF"
+        overall["n_train"] = np.nan
+        overall["n_valid"] = len(y)
+        all_rows.append(overall)
+
+    cv_results = pd.DataFrame(all_rows)
+    cv_results.to_csv(OUTPUT_DIR / "cv_all_fold_metrics.csv", index=False)
+
+    summary = (
+        cv_results[cv_results["fold"] != "OOF"]
+        .groupby("model")
+        .agg(
+            roc_auc_mean=("roc_auc", "mean"),
+            roc_auc_std=("roc_auc", "std"),
+            pr_auc_mean=("pr_auc", "mean"),
+            pr_auc_std=("pr_auc", "std"),
+            accuracy_mean=("accuracy", "mean"),
+            precision_mean=("precision", "mean"),
+            recall_mean=("recall", "mean"),
+            specificity_mean=("specificity", "mean"),
+            f1_mean=("f1", "mean"),
+            balanced_accuracy_mean=("balanced_accuracy", "mean"),
+            mcc_mean=("mcc", "mean"),
+            log_loss_mean=("log_loss", "mean"),
+        )
+        .reset_index()
+        .sort_values(["pr_auc_mean", "roc_auc_mean"], ascending=False)
+    )
+
+    summary.to_csv(OUTPUT_DIR / "model_comparison_summary.csv", index=False)
+
+    print("\nMODEL COMPARISON:")
+    print(summary.to_string(index=False))
+
+    return pipelines, summary, oof_probabilities
+
+
+# ------------------------------------------------------------
+# ROC / PR CURVES FROM OOF PREDICTIONS
+# ------------------------------------------------------------
+
+def plot_model_curves(y, oof_probabilities):
+    plt.figure(figsize=(8, 6))
+    for name, prob in oof_probabilities.items():
+        try:
+            fpr, tpr, _ = roc_curve(y, prob)
+            auc = roc_auc_score(y, prob)
+            plt.plot(fpr, tpr, label=f"{name} (AUC={auc:.3f})")
+        except Exception:
+            continue
+    plt.plot([0, 1], [0, 1], linestyle="--")
+    plt.xlabel("False Positive Rate")
+    plt.ylabel("True Positive Rate")
+    plt.title("OOF ROC-AUC Comparison")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(OUTPUT_DIR / "roc_auc_comparison.png", dpi=180)
+    plt.close()
+
+    plt.figure(figsize=(8, 6))
+    for name, prob in oof_probabilities.items():
+        try:
+            precision, recall, _ = precision_recall_curve(y, prob)
+            auc = average_precision_score(y, prob)
+            plt.plot(recall, precision, label=f"{name} (PR-AUC={auc:.3f})")
+        except Exception:
+            continue
+    plt.xlabel("Recall")
+    plt.ylabel("Precision")
+    plt.title("OOF Precision-Recall AUC Comparison")
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(OUTPUT_DIR / "pr_auc_comparison.png", dpi=180)
+    plt.close()
+
+
+# ------------------------------------------------------------
+# THRESHOLD ANALYSIS
+# ------------------------------------------------------------
+
+def threshold_analysis(y, prob, model_name):
+    rows = []
+    for threshold in np.arange(0.10, 0.91, 0.05):
+        m = evaluate_binary(y, prob, float(threshold))
+        m["threshold"] = round(float(threshold), 2)
+        rows.append(m)
+
+    out = pd.DataFrame(rows)
+    out.to_csv(
+        OUTPUT_DIR / f"{safe_filename(model_name)}_threshold_analysis.csv",
+        index=False,
+    )
+
+    # Preferred constraint from the earlier approach:
+    # maximize positive-class recall while maintaining negative-class
+    # recall/specificity above 0.70.
+    feasible = out[out["specificity"] >= 0.70].copy()
+
+    if not feasible.empty:
+        best = feasible.sort_values(
+            ["recall", "f1", "pr_auc"],
+            ascending=False,
+        ).iloc[0]
+    else:
+        best = out.sort_values(
+            ["balanced_accuracy", "f1"],
+            ascending=False,
+        ).iloc[0]
+
+    print(
+        f"\n{model_name} selected threshold: {best['threshold']:.2f} "
+        f"(specificity={best['specificity']:.4f}, "
+        f"recall={best['recall']:.4f}, "
+        f"F1={best['f1']:.4f})"
+    )
+
+    return float(best["threshold"]), out
+
+
+def safe_filename(x: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", x)
+
+
+# ------------------------------------------------------------
+# FEATURE IMPORTANCE / INTERPRETABILITY
+# ------------------------------------------------------------
+
+def save_feature_importance(fitted_pipeline, X_train, y_train, model_name):
+    try:
+        pre = fitted_pipeline.named_steps["preprocess"]
+        model = fitted_pipeline.named_steps["model"]
+
+        feature_names = pre.get_feature_names_out()
+
+        if hasattr(model, "coef_"):
+            vals = np.asarray(model.coef_).ravel()
+            imp = pd.DataFrame({
+                "feature": feature_names,
+                "coefficient": vals,
+                "abs_importance": np.abs(vals),
+            }).sort_values("abs_importance", ascending=False)
+            imp.to_csv(
+                OUTPUT_DIR / f"{safe_filename(model_name)}_coefficients.csv",
+                index=False,
+            )
+
+        elif hasattr(model, "feature_importances_"):
+            vals = np.asarray(model.feature_importances_)
+            imp = pd.DataFrame({
+                "feature": feature_names,
+                "importance": vals,
+            }).sort_values("importance", ascending=False)
+            imp.to_csv(
+                OUTPUT_DIR / f"{safe_filename(model_name)}_feature_importance.csv",
+                index=False,
+            )
+
+    except Exception as e:
+        print(f"Feature importance warning for {model_name}:", e)
+
+
+def permutation_importance_validation(
+    fitted_pipeline,
+    X_valid,
+    y_valid,
+    model_name,
+    group_col,
+):
+    try:
+        Xv = X_valid.drop(columns=[group_col], errors="ignore")
+        result = permutation_importance(
+            fitted_pipeline,
+            Xv,
+            y_valid,
+            scoring="average_precision",
+            n_repeats=5,
+            random_state=RANDOM_STATE,
+            n_jobs=-1,
+        )
+        names = Xv.columns
+        imp = pd.DataFrame({
+            "feature": names,
+            "importance_mean": result.importances_mean,
+            "importance_std": result.importances_std,
+        }).sort_values("importance_mean", ascending=False)
+        imp.to_csv(
+            OUTPUT_DIR / f"{safe_filename(model_name)}_validation_permutation_importance.csv",
+            index=False,
+        )
+    except Exception as e:
+        print("Permutation importance warning:", e)
+
+
+# ------------------------------------------------------------
+# MUTUAL INFORMATION — TRAINING ONLY
+# ------------------------------------------------------------
+
+def run_mutual_information(train_X, train_y):
+    try:
+        X = train_X.select_dtypes(include=np.number).copy()
+        X = X.replace([np.inf, -np.inf], np.nan)
+        X = X.fillna(X.median(numeric_only=True))
+
+        if X.shape[1] == 0:
+            return
+
+        scores = mutual_info_classif(
+            X.to_numpy(),
+            np.asarray(train_y),
+            random_state=RANDOM_STATE,
+        )
+        out = pd.DataFrame({
+            "feature": X.columns,
+            "mutual_information": scores,
+        }).sort_values("mutual_information", ascending=False)
+        out.to_csv(OUTPUT_DIR / "training_mutual_information.csv", index=False)
+        print("\nTop mutual-information features:")
+        print(out.head(20))
+    except Exception as e:
+        print("Mutual information warning:", e)
+
+
+# ------------------------------------------------------------
+# FINAL FIT + VALIDATION REPORT
+# ------------------------------------------------------------
+
+def fit_final_models(
+    pipelines,
+    X_train,
+    y_train,
+    X_valid,
+    y_valid,
+    group_col,
+):
+    fitted = {}
+    validation_rows = []
+
+    model_X_train = X_train.drop(columns=[group_col], errors="ignore").copy()
+    model_X_valid = X_valid.drop(columns=[group_col], errors="ignore").copy()
+
+    for name, pipe in pipelines.items():
+        print("\nFitting final model on training split:", name)
+        model = clone(pipe)
+        model.fit(model_X_train, np.asarray(y_train, dtype=int))
+
+        prob = model.predict_proba(model_X_valid)[:, 1]
+
+        threshold, threshold_table = threshold_analysis(
+            y_valid,
+            prob,
+            name,
+        )
+
+        m50 = evaluate_binary(y_valid, prob, 0.50)
+        msel = evaluate_binary(y_valid, prob, threshold)
+
+        row = {
+            "model": name,
+            "threshold": threshold,
+            **{f"validation_50_{k}": v for k, v in m50.items()},
+            **{f"validation_selected_{k}": v for k, v in msel.items()},
+        }
+        validation_rows.append(row)
+
+        print("\nClassification report at 0.50:")
+        print(classification_report(
+            y_valid,
+            (prob >= 0.50).astype(int),
+            digits=4,
+            zero_division=0,
+        ))
+
+        print("Confusion matrix at 0.50:")
+        print(confusion_matrix(y_valid, (prob >= 0.50).astype(int), labels=[0, 1]))
+
+        save_feature_importance(model, model_X_train, y_train, name)
+        permutation_importance_validation(
+            model,
+            model_X_valid,
+            y_valid,
+            name,
+            group_col,
+        )
+
+        fitted[name] = {
+            "pipeline": model,
+            "prob_valid": prob,
+            "threshold": threshold,
+        }
+
+    val_df = pd.DataFrame(validation_rows)
+    val_df.to_csv(OUTPUT_DIR / "validation_model_metrics.csv", index=False)
+
+    return fitted, val_df
+
+
+# ------------------------------------------------------------
+# CHOOSE BEST MODEL
+# ------------------------------------------------------------
+
+def choose_best_model(summary, validation_df):
+    """
+    Primary objective: PR-AUC because the task is imbalanced.
+    Secondary: ROC-AUC, recall, F1.
+
+    The threshold is chosen separately with specificity >= 0.70 where possible.
+    """
+    if summary.empty:
+        raise ValueError("No model results available.")
+
+    ranked = summary.copy()
+    ranked = ranked.sort_values(
+        ["pr_auc_mean", "roc_auc_mean", "recall_mean", "f1_mean"],
+        ascending=False,
+    )
+
+    best_name = ranked.iloc[0]["model"]
+    print("\nBEST MODEL BY OOF PR-AUC:", best_name)
+    return str(best_name)
+
+
+# ------------------------------------------------------------
+# FINAL REFIT ON ALL LABELLED DATA
+# ------------------------------------------------------------
+
+def refit_best_model_and_predict_test(
+    best_name,
+    pipelines,
+    all_labelled_features,
+    all_y,
+    test_features,
+    group_col,
+    selected_threshold,
+):
+    """
+    Final model is fit on ALL labelled physicians only.
+
+    Test physicians are only transformed/predicted after fitting.
+    """
+    X_all = all_labelled_features.drop(columns=[group_col], errors="ignore").copy()
+    X_test = test_features.drop(columns=[group_col], errors="ignore").copy()
+
+    final_model = clone(pipelines[best_name])
+    final_model.fit(X_all, np.asarray(all_y, dtype=int))
+
+    test_prob = final_model.predict_proba(X_test)[:, 1]
+    test_pred = (test_prob >= selected_threshold).astype(int)
+
+    result = test_features.copy()
+    result["predicted_probability"] = test_prob
+    result["predicted_class"] = test_pred
+    result["rank"] = (
+        result["predicted_probability"]
+        .rank(method="first", ascending=False)
+        .astype(int)
+    )
+    result = result.sort_values(
+        ["predicted_probability"],
+        ascending=False,
+    ).reset_index(drop=True)
+
+    result.to_csv(
+        OUTPUT_DIR / "final_test_predictions_all_1502.csv",
+        index=False,
+    )
+
+    top_n = min(200, len(result))
+    result.head(top_n).to_csv(
+        OUTPUT_DIR / f"top_{top_n}_targeted_physicians.csv",
+        index=False,
+    )
+
+    print("\nFinal test prediction shape:", result.shape)
+    print("Expected test size:", EXPECTED_TEST_SIZE)
+    if len(result) != EXPECTED_TEST_SIZE:
+        print(
+            "WARNING: actual test size differs from expected 1502. "
+            "Check your test file/selection rule."
+        )
+
+    print("\nTop 20 test predictions:")
+    print(result.head(20).to_string(index=False))
+
+    return final_model, result
+
+
+# ------------------------------------------------------------
+# DATASET PREPARATION
+# ------------------------------------------------------------
+
+def prepare_labelled_and_test():
+    """
+    Supports:
+      A) separate labelled DATA_PATH + separate TEST_PATH
+      B) one combined file where target is missing for test rows
+      C) one combined file with TEST_FLAG_COL
+    """
+    labelled = load_table(DATA_PATH)
+
+    target_col = detect_target(labelled)
+    group_col = detect_group(labelled)
+
+    print("\nDetected target:", target_col)
+    print("Detected group:", group_col)
+
+    if TEST_PATH:
+        test = load_table(TEST_PATH)
+        return labelled, test, target_col, group_col
+
+    # Combined-file mode.
+    if TEST_FLAG_COL and TEST_FLAG_COL in labelled.columns:
+        mask_test = labelled[TEST_FLAG_COL] == TEST_FLAG_VALUE
+        test = labelled.loc[mask_test].copy()
+        labelled = labelled.loc[~mask_test].copy()
+        return labelled, test, target_col, group_col
+
+    # If target has missing values, assume those are the unlabeled test rows.
+    if labelled[target_col].isna().any():
+        mask_test = labelled[target_col].isna()
+        test = labelled.loc[mask_test].drop(columns=[target_col], errors="ignore").copy()
+        labelled = labelled.loc[~mask_test].copy()
+        return labelled, test, target_col, group_col
+
+    raise ValueError(
+        "No separate TEST_PATH, TEST_FLAG_COL, or missing-target test rows were found. "
+        "Set TEST_PATH or configure TEST_FLAG_COL."
+    )
+
+
+# ------------------------------------------------------------
+# MAIN
+# ------------------------------------------------------------
+
+def main():
+    print("=" * 90)
+    print("STARTING END-TO-END LEAKAGE-SAFE PIPELINE")
+    print("=" * 90)
+
+    # --------------------------------------------------------
+    # STEP 1: LOAD ONLY
+    # No EDA, feature selection, scaling or model fitting here.
+    # --------------------------------------------------------
+    labelled_raw, test_raw, target_col, group_col = prepare_labelled_and_test()
+
+    print("\nLabelled shape:", labelled_raw.shape)
+    print("Test shape:", test_raw.shape)
+
+    # Test target should not be used.
+    if target_col in test_raw.columns:
+        test_raw = test_raw.drop(columns=[target_col])
+
+    # --------------------------------------------------------
+    # STEP 2: ENCODE TARGET
+    # Still no EDA/model fitting.
+    # --------------------------------------------------------
+    y_encoded, target_mapping = encode_binary_target(labelled_raw[target_col])
+    labelled = labelled_raw.copy()
+    labelled[target_col] = y_encoded
+
+    with open(OUTPUT_DIR / "target_mapping.json", "w", encoding="utf-8") as f:
+        json.dump(target_mapping, f, indent=2)
+
+    # --------------------------------------------------------
+    # STEP 3: SPLIT BEFORE EDA
+    # --------------------------------------------------------
+    train_df, valid_df = split_train_validation(
+        labelled,
+        target_col,
+        group_col,
+    )
+
+    print("\n" + "=" * 90)
+    print("TRAIN / VALIDATION SPLIT COMPLETED BEFORE EDA")
+    print("=" * 90)
+    print("Train:", train_df.shape)
+    print("Validation:", valid_df.shape)
+    print("Train target distribution:")
+    print(train_df[target_col].value_counts(normalize=True))
+    print("Validation target distribution:")
+    print(valid_df[target_col].value_counts(normalize=True))
+
+    # Check group overlap.
+    if group_col and group_col in train_df.columns and group_col in valid_df.columns:
+        overlap = set(train_df[group_col].dropna()) & set(valid_df[group_col].dropna())
+        print("Group overlap between train and validation:", len(overlap))
+        if overlap:
+            raise RuntimeError(
+                "LEAKAGE CHECK FAILED: groups overlap between train and validation."
+            )
+
+    # --------------------------------------------------------
+    # STEP 4: EDA ONLY ON TRAINING SPLIT
+    # --------------------------------------------------------
+    run_simple_eda(train_df, target_col, group_col)
+
+    # --------------------------------------------------------
+    # STEP 5: FEATURE ENGINEERING
+    # Engineer each split independently.
+    # No target-derived features.
+    # --------------------------------------------------------
+    print("\n" + "=" * 90)
+    print("FEATURE ENGINEERING")
+    print("=" * 90)
+
+    train_fe = advanced_feature_engineering(train_df, target_col, group_col)
+    valid_fe = advanced_feature_engineering(valid_df, target_col, group_col)
+    test_fe = advanced_feature_engineering(test_raw, target_col, group_col)
+
+    # Align columns without using validation/test to learn values.
+    # Since the engineering is deterministic, the same generated feature names
+    # are aligned safely.
+    feature_union = [
+        c for c in train_fe.columns
+        if c != target_col
+    ]
+
+    # Keep only training-derived feature names.
+    train_fe = train_fe[[c for c in train_fe.columns if c == target_col or c in feature_union]].copy()
+    valid_fe = valid_fe.reindex(columns=[c for c in valid_fe.columns if c != target_col and c in feature_union] + [target_col if target_col in valid_fe.columns else target_col])
+    test_fe = test_fe.reindex(columns=[c for c in test_fe.columns if c in feature_union])
+
+    # Reindex validation to EXACT train feature columns.
+    train_X = train_fe.drop(columns=[target_col], errors="ignore").copy()
+    valid_X = valid_fe.drop(columns=[target_col], errors="ignore").reindex(columns=train_X.columns).copy()
+    test_X = test_fe.reindex(columns=train_X.columns).copy()
+
+    y_train = train_fe[target_col].astype(int)
+    y_valid = valid_fe[target_col].astype(int)
+
+    # --------------------------------------------------------
+    # STEP 6: CORRELATION / VIF ON TRAIN ONLY
+    # --------------------------------------------------------
+    run_correlation_and_vif(train_fe, target_col)
+
+    # --------------------------------------------------------
+    # STEP 7: MUTUAL INFORMATION ON TRAIN ONLY
+    # --------------------------------------------------------
+    run_mutual_information(train_X, y_train)
+
+    # --------------------------------------------------------
+    # STEP 8: CV ON TRAINING SPLIT ONLY
+    # Validation is not used to tune CV models.
+    # --------------------------------------------------------
+    cv_input = train_fe.copy()
+    pipelines, summary, oof_probabilities = cross_validate_models(
+        cv_input,
+        y_train,
+        group_col,
+    )
+
+    plot_model_curves(y_train, oof_probabilities)
+
+    # --------------------------------------------------------
+    # STEP 9: VALIDATION EVALUATION
+    # --------------------------------------------------------
+    fitted_models, validation_df = fit_final_models(
+        pipelines,
+        train_fe,
+        y_train,
+        valid_fe,
+        y_valid,
+        group_col,
+    )
+
+    best_name = choose_best_model(summary, validation_df)
+
+    # Get the selected threshold for best model.
+    best_threshold = float(
+        validation_df.loc[
+            validation_df["model"] == best_name,
+            "threshold"
+        ].iloc[0]
+    )
+
+    # --------------------------------------------------------
+    # STEP 10: FINAL FIT ON ALL LABELLED DATA
+    # This is the first point where train + validation are combined.
+    # --------------------------------------------------------
+    all_labelled_fe = advanced_feature_engineering(
+        labelled,
+        target_col,
+        group_col,
+    )
+
+    # Ensure exactly the same feature columns used by the training model.
+    all_X = all_labelled_fe.drop(columns=[target_col], errors="ignore")
+    all_X = all_X.reindex(columns=train_X.columns)
+
+    # Test is transformed independently; no test fitting.
+    final_test_X = test_fe.reindex(columns=train_X.columns)
+
+    final_model, test_predictions = refit_best_model_and_predict_test(
+        best_name,
+        pipelines,
+        all_X.assign(**{target_col: all_labelled_fe[target_col].to_numpy()}),
+        all_labelled_fe[target_col].astype(int),
+        final_test_X,
+        group_col,
+        best_threshold,
+    )
+
+    # --------------------------------------------------------
+    # STEP 11: FINAL AUDIT
+    # --------------------------------------------------------
+    audit = {
+        "target_column": target_col,
+        "group_column": group_col,
+        "labelled_rows": int(len(labelled)),
+        "train_rows": int(len(train_df)),
+        "validation_rows": int(len(valid_df)),
+        "test_rows": int(len(test_raw)),
+        "expected_test_rows": int(EXPECTED_TEST_SIZE),
+        "group_overlap_train_validation": None,
+        "test_target_used_for_fit": False,
+        "smotetomek_available": bool(IMBLEARN_AVAILABLE),
+        "xgboost_available": bool(XGBOOST_AVAILABLE),
+        "best_model": best_name,
+        "selected_threshold": best_threshold,
+        "momentum_columns": [
+            c for c in train_X.columns
+            if "momentum" in str(c).lower()
+        ],
+    }
+
+    if group_col and group_col in train_df.columns and group_col in valid_df.columns:
+        audit["group_overlap_train_validation"] = int(
+            len(
+                set(train_df[group_col].dropna())
+                & set(valid_df[group_col].dropna())
+            )
+        )
+
+    with open(OUTPUT_DIR / "pipeline_audit.json", "w", encoding="utf-8") as f:
+        json.dump(audit, f, indent=2, default=str)
+
+    print("\n" + "=" * 90)
+    print("PIPELINE COMPLETED")
+    print("=" * 90)
+    print("Best model:", best_name)
+    print("Selected threshold:", best_threshold)
+    print("Test predictions:", OUTPUT_DIR / "final_test_predictions_all_1502.csv")
+    print("Top-200 file:", OUTPUT_DIR / "top_200_targeted_physicians.csv")
+    print("Model comparison:", OUTPUT_DIR / "model_comparison_summary.csv")
+    print("ROC curve:", OUTPUT_DIR / "roc_auc_comparison.png")
+    print("PR curve:", OUTPUT_DIR / "pr_auc_comparison.png")
+    print("\nIMPORTANT: If the actual test file does not contain exactly 1502 rows,")
+    print("the script will warn rather than silently dropping/creating physicians.")
+
+
+if __name__ == "__main__":
+    main()
