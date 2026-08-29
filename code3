@@ -1,0 +1,304 @@
+# ==============================================================================
+# ABC PHARMACEUTICALS - DRUG XYZ ADOPTION PREDICTION PIPELINE (STRICT NO-LEAKAGE)
+# ==============================================================================
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.cluster import KMeans
+from sklearn.metrics import (
+    roc_auc_score, f1_score, precision_score, recall_score, 
+    accuracy_score, average_precision_score, roc_curve, precision_recall_curve
+)
+from statsmodels.stats.outliers_influence import variance_inflation_factor
+import xgboost as xgb
+import optuna
+import warnings
+
+warnings.filterwarnings('ignore')
+optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+RANDOM_STATE = 42
+np.random.seed(RANDOM_STATE)
+
+# ------------------------------------------------------------------------------
+# STEP 1: DATA LOADING & DEFINING TARGET VARIABLE
+# ------------------------------------------------------------------------------
+print("--- STEP 1: Loading Data & Defining Target ---")
+
+df_long = pd.read_csv('input_data_file1.csv')
+df_static = pd.read_csv('input_data_file2.csv')
+test_physicians = pd.read_csv('test_physicians.csv')
+
+# Target Definition: adopted = 1 if rx_count > 0 in ANY quarter Q1-Q10, else 0
+physician_rx_totals = df_long.groupby('physician_id')['rx_count'].sum().reset_index()
+physician_rx_totals['adopted'] = (physician_rx_totals['rx_count'] > 0).astype(int)
+target_df = physician_rx_totals[['physician_id', 'adopted']]
+
+test_ids = set(test_physicians['physician_id'].unique())
+
+# Split into Train Pool and Test Pool BEFORE Feature Engineering
+train_phys_ids = set(df_static['physician_id']) - test_ids
+
+# ------------------------------------------------------------------------------
+# STEP 2: FEATURE ENGINEERING (STRICT ISOLATION & NO rx_count LEAKAGE)
+# ------------------------------------------------------------------------------
+print("\n--- STEP 2: Feature Engineering ---")
+
+df_long_no_rx = df_long.drop(columns=['rx_count']).copy()
+df_long_no_rx['q_num'] = df_long_no_rx['quarter'].str.replace('Q', '').astype(int)
+
+# Aggregations across quarters
+agg_totals = df_long_no_rx.groupby('physician_id').agg(
+    total_rep_calls=('rep_calls', 'sum'),
+    total_samples=('samples_provided', 'sum'),
+    total_digital_engagements=('digital_engagements', 'sum'),
+    total_competitive_rx=('competitive_rx_count', 'sum'),
+    avg_peer_network_score=('peer_network_score', 'mean'),
+    total_med_edu_events=('medical_education_events', 'sum'),
+    total_congress_attendance=('congress_attendance', 'sum')
+).reset_index()
+
+# Recency Window (Q8-Q10 Mean)
+q8_10 = df_long_no_rx[df_long_no_rx['q_num'] >= 8]
+recency = q8_10.groupby('physician_id').agg(
+    recency_rep_calls=('rep_calls', 'mean'),
+    recency_samples=('samples_provided', 'mean'),
+    recency_digital=('digital_engagements', 'mean'),
+    speaker_recency_q8_q10=('speaker_program_attendance', 'sum')
+).reset_index()
+
+# Early Window (Q1-Q3 Mean)
+q1_3 = df_long_no_rx[df_long_no_rx['q_num'] <= 3]
+early = q1_3.groupby('physician_id').agg(
+    early_rep_calls=('rep_calls', 'mean'),
+    early_samples=('samples_provided', 'mean'),
+    early_digital=('digital_engagements', 'mean'),
+    early_comp_rx=('competitive_rx_count', 'mean')
+).reset_index()
+
+features = pd.merge(agg_totals, recency, on='physician_id')
+features = pd.merge(features, early, on='physician_id')
+
+# Trend Features
+features['trend_rep_calls'] = features['recency_rep_calls'] - features['early_rep_calls']
+features['trend_samples'] = features['recency_samples'] - features['early_samples']
+features['trend_digital'] = features['recency_digital'] - features['early_digital']
+
+q8_10_comp = q8_10.groupby('physician_id')['competitive_rx_count'].mean().reset_index().rename(columns={'competitive_rx_count': 'recency_comp_rx'})
+features = pd.merge(features, q8_10_comp, on='physician_id')
+features['trend_comp_rx'] = features['recency_comp_rx'] - features['early_comp_rx']
+
+# Drop raw window variables causing collinearity
+features.drop(columns=['early_rep_calls', 'early_samples', 'early_digital', 'early_comp_rx', 'recency_comp_rx'], inplace=True)
+
+df_full = pd.merge(features, df_static, on='physician_id')
+df_full = pd.merge(df_full, target_df, on='physician_id')
+
+# Split dataset into Train Set and Unseen Test Set
+df_train_pool = df_full[df_full['physician_id'].isin(train_phys_ids)].copy()
+df_test_set = df_full[df_full['physician_id'].isin(test_ids)].copy()
+
+# Fit K-Means Clustering STRICTLY on Training Set
+cluster_cols = ['total_rep_calls', 'total_samples', 'total_digital_engagements', 'avg_peer_network_score']
+scaler_kmeans = StandardScaler()
+train_cluster_scaled = scaler_kmeans.fit_transform(df_train_pool[cluster_cols])
+
+kmeans = KMeans(n_clusters=4, random_state=RANDOM_STATE)
+df_train_pool['physician_cluster'] = kmeans.fit_predict(train_cluster_scaled).astype(str)
+
+test_cluster_scaled = scaler_kmeans.transform(df_test_set[cluster_cols])
+df_test_set['physician_cluster'] = kmeans.predict(test_cluster_scaled).astype(str)
+
+# ------------------------------------------------------------------------------
+# STEP 3: TRAIN / VALIDATION SPLIT & VIF PRUNING
+# ------------------------------------------------------------------------------
+print("\n--- STEP 3: Split & VIF Filtering ---")
+
+categorical_cols = ['specialty', 'practice_type', 'geographic_region', 'physician_cluster', 'practice_size']
+numeric_cols = [
+    'years_in_practice', 'hcp_decile', 'payer_access_score', 'kol_flag', 'hospital_affiliation',
+    'board_certified', 'total_rep_calls', 'total_samples', 'total_digital_engagements',
+    'total_competitive_rx', 'avg_peer_network_score', 'total_med_edu_events',
+    'total_congress_attendance', 'recency_rep_calls', 'recency_samples', 'recency_digital',
+    'speaker_recency_q8_q10', 'trend_rep_calls', 'trend_samples', 'trend_digital', 'trend_comp_rx'
+]
+
+X_pool = df_train_pool[numeric_cols + categorical_cols]
+y_pool = df_train_pool['adopted']
+
+X_train, X_val, y_train, y_val = train_test_split(
+    X_pool, y_pool, test_size=0.20, stratify=y_pool, random_state=RANDOM_STATE
+)
+
+# Multicollinearity Check (VIF Threshold = 10.0)
+def reduce_vif(df_num, threshold=10.0):
+    scaler_vif = StandardScaler()
+    scaled_vals = scaler_vif.fit_transform(df_num)
+    df_scaled = pd.DataFrame(scaled_vals, columns=df_num.columns)
+    
+    features_curr = list(df_num.columns)
+    while True:
+        vif_vals = [variance_inflation_factor(df_scaled[features_curr].values, i) for i in range(len(features_curr))]
+        max_vif = max(vif_vals)
+        if max_vif > threshold:
+            max_feature = features_curr[np.argmax(vif_vals)]
+            print(f"Dropping high-VIF feature: '{max_feature}' (VIF = {max_vif:.2f})")
+            features_curr.remove(max_feature)
+        else:
+            break
+    return features_curr
+
+numeric_cols_clean = reduce_vif(X_train[numeric_cols], threshold=10.0)
+
+preprocessor = ColumnTransformer(
+    transformers=[
+        ('num', StandardScaler(), numeric_cols_clean),
+        ('cat', OneHotEncoder(drop='first', handle_unknown='ignore'), categorical_cols)
+    ]
+)
+
+# Helper function to compute Train and Validation Metrics
+def get_metrics(model_name, pipeline, X_tr, y_tr, X_v, y_v):
+    y_tr_proba = pipeline.predict_proba(X_tr)[:, 1]
+    y_v_proba = pipeline.predict_proba(X_v)[:, 1]
+    
+    y_tr_pred = (y_tr_proba >= 0.5).astype(int)
+    y_v_pred = (y_v_proba >= 0.5).astype(int)
+    
+    return {
+        'Model': model_name,
+        'Train Acc': round(accuracy_score(y_tr, y_tr_pred), 4),
+        'Val Acc': round(accuracy_score(y_v, y_v_pred), 4),
+        'Train F1': round(f1_score(y_tr, y_tr_pred, zero_division=0), 4),
+        'Val F1': round(f1_score(y_v, y_v_pred, zero_division=0), 4),
+        'Train Precision': round(precision_score(y_tr, y_tr_pred, zero_division=0), 4),
+        'Val Precision': round(precision_score(y_v, y_v_pred, zero_division=0), 4),
+        'Train Recall': round(recall_score(y_tr, y_tr_pred, zero_division=0), 4),
+        'Val Recall': round(recall_score(y_v, y_v_pred, zero_division=0), 4),
+        'Train ROC-AUC': round(roc_auc_score(y_tr, y_tr_proba), 4),
+        'Val ROC-AUC': round(roc_auc_score(y_v, y_v_proba), 4),
+        'Train PR-AUC': round(average_precision_score(y_tr, y_tr_proba), 4),
+        'Val PR-AUC': round(average_precision_score(y_v, y_v_proba), 4)
+    }, y_v_proba
+
+# ------------------------------------------------------------------------------
+# STEP 4: HYPERPARAMETER TUNING WITH OPTUNA (XGBoost)
+# ------------------------------------------------------------------------------
+print("\n--- STEP 4: Tuning XGBoost with Optuna ---")
+
+X_train_trans = preprocessor.fit_transform(X_train)
+X_val_trans = preprocessor.transform(X_val)
+
+def objective(trial):
+    params = {
+        'n_estimators': trial.suggest_int('n_estimators', 50, 250),
+        'max_depth': trial.suggest_int('max_depth', 2, 6),
+        'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.1, log=True),
+        'subsample': trial.suggest_float('subsample', 0.6, 0.95),
+        'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 0.95),
+        'reg_alpha': trial.suggest_float('reg_alpha', 1e-3, 10.0, log=True),
+        'reg_lambda': trial.suggest_float('reg_lambda', 1e-3, 10.0, log=True),
+        'random_state': RANDOM_STATE,
+        'eval_metric': 'logloss'
+    }
+    
+    clf = xgb.XGBClassifier(**params)
+    clf.fit(X_train_trans, y_train)
+    preds_proba = clf.predict_proba(X_val_trans)[:, 1]
+    return roc_auc_score(y_val, preds_proba)
+
+study = optuna.create_study(direction='maximize')
+study.optimize(objective, n_trials=30)
+print(f"Best Optuna Val ROC-AUC: {study.best_value:.4f}")
+print("Best Hyperparameters:", study.best_params)
+
+# ------------------------------------------------------------------------------
+# STEP 5: MODEL TRAINING & DETAILED EVALUATION
+# ------------------------------------------------------------------------------
+print("\n--- STEP 5: Model Comparisons ---")
+
+# 1. Baseline Logistic Regression
+logreg_pipe = Pipeline([('preprocessor', preprocessor), ('classifier', LogisticRegression(max_iter=1000, random_state=RANDOM_STATE))])
+logreg_pipe.fit(X_train, y_train)
+m_lr, y_val_proba_lr = get_metrics("Logistic Regression", logreg_pipe, X_train, y_train, X_val, y_val)
+
+# 2. Random Forest
+rf_pipe = Pipeline([('preprocessor', preprocessor), ('classifier', RandomForestClassifier(n_estimators=150, max_depth=8, random_state=RANDOM_STATE, n_jobs=-1))])
+rf_pipe.fit(X_train, y_train)
+m_rf, y_val_proba_rf = get_metrics("Random Forest", rf_pipe, X_train, y_train, X_val, y_val)
+
+# 3. Optuna-Tuned XGBoost
+best_xgb_clf = xgb.XGBClassifier(**study.best_params, random_state=RANDOM_STATE, eval_metric='logloss')
+xgb_pipe = Pipeline([('preprocessor', preprocessor), ('classifier', best_xgb_clf)])
+xgb_pipe.fit(X_train, y_train)
+m_xgb, y_val_proba_xgb = get_metrics("XGBoost (Optuna Tuned)", xgb_pipe, X_train, y_train, X_val, y_val)
+
+# Print Detailed Train & Validation Metrics Comparison Table
+metrics_df = pd.DataFrame([m_lr, m_rf, m_xgb])
+print("\n=== TRAIN VS VALIDATION METRICS COMPARISON ===")
+print(metrics_df.to_string(index=False))
+
+# ------------------------------------------------------------------------------
+# STEP 6: PLOTTING ROC-AUC AND PR-AUC CURVES
+# ------------------------------------------------------------------------------
+print("\n--- STEP 6: Plotting ROC & PR Curves ---")
+
+fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+
+# ROC Curves
+fpr_lr, tpr_lr, _ = roc_curve(y_val, y_val_proba_lr)
+fpr_rf, tpr_rf, _ = roc_curve(y_val, y_val_proba_rf)
+fpr_xgb, tpr_xgb, _ = roc_curve(y_val, y_val_proba_xgb)
+
+axes[0].plot(fpr_lr, tpr_lr, label=f"LogReg (AUC = {m_lr['Val ROC-AUC']})")
+axes[0].plot(fpr_rf, tpr_rf, label=f"Random Forest (AUC = {m_rf['Val ROC-AUC']})")
+axes[0].plot(fpr_xgb, tpr_xgb, label=f"XGBoost Optuna (AUC = {m_xgb['Val ROC-AUC']})", linewidth=2.5)
+axes[0].plot([0, 1], [0, 1], 'k--', alpha=0.5)
+axes[0].set_title('Validation ROC Curve', fontsize=12, fontweight='bold')
+axes[0].set_xlabel('False Positive Rate')
+axes[0].set_ylabel('True Positive Rate')
+axes[0].legend(loc='lower right')
+axes[0].grid(True, alpha=0.3)
+
+# PR Curves
+p_lr, r_lr, _ = precision_recall_curve(y_val, y_val_proba_lr)
+p_rf, r_rf, _ = precision_recall_curve(y_val, y_val_proba_rf)
+p_xgb, r_xgb, _ = precision_recall_curve(y_val, y_val_proba_xgb)
+
+axes[1].plot(r_lr, p_lr, label=f"LogReg (PR-AUC = {m_lr['Val PR-AUC']})")
+axes[1].plot(r_rf, p_rf, label=f"Random Forest (PR-AUC = {m_rf['Val PR-AUC']})")
+axes[1].plot(r_xgb, p_xgb, label=f"XGBoost Optuna (PR-AUC = {m_xgb['Val PR-AUC']})", linewidth=2.5)
+axes[1].set_title('Validation Precision-Recall Curve', fontsize=12, fontweight='bold')
+axes[1].set_xlabel('Recall')
+axes[1].set_ylabel('Precision')
+axes[1].legend(loc='lower left')
+axes[1].grid(True, alpha=0.3)
+
+plt.tight_layout()
+plt.savefig('evaluation_curves.png', dpi=300)
+plt.show()
+
+# ------------------------------------------------------------------------------
+# STEP 7: PREDICTIONS ON 1,502 TEST PHYSICIANS
+# ------------------------------------------------------------------------------
+print("\n--- STEP 7: Output Generation ---")
+
+X_test = df_test_set[numeric_cols + categorical_cols]
+
+df_test_set['adoption_probability'] = xgb_pipe.predict_proba(X_test)[:, 1]
+df_test_set['adoption_prediction'] = (df_test_set['adoption_probability'] >= 0.5).astype(int)
+
+# Sort predictions descending by adoption probability
+df_test_set = df_test_set.sort_values('adoption_probability', ascending=False).reset_index(drop=True)
+
+# Export predictions
+out_cols = ['physician_id', 'adoption_probability', 'adoption_prediction'] + numeric_cols_clean + categorical_cols
+df_test_set[out_cols].to_csv('predictions.csv', index=False)
+print(f"Generated 'predictions.csv' for {len(df_test_set)} test physicians.")
