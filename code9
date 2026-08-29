@@ -1,0 +1,5594 @@
+# ================================================================
+# ABC PHARMACEUTICALS - DRUG XYZ Q11 ADOPTION PREDICTION
+# COMPLETE END-TO-END MACHINE LEARNING PIPELINE
+# ================================================================
+#
+# MODELLING APPROACH FROM THE PROVIDED PROBLEM STATEMENT
+#
+# 1. Data loading and merging
+# 2. Target definition
+# 3. Complete EDA
+# 4. OLS regression
+# 5. Multicollinearity / VIF
+# 6. Temporal feature engineering
+# 7. K-Means behavioural segmentation
+# 8. Territory-level features
+# 9. Train-validation split
+# 10. Logistic Regression
+# 11. Mixed-effects / territory model
+# 12. Random Forest + OOB
+# 13. XGBoost / Gradient Boosting
+# 14. 5-fold CV hyperparameter tuning
+# 15. Comprehensive validation metrics
+# 16. ROC-AUC curves
+# 17. Precision-Recall curves
+# 18. Confusion matrices
+# 19. Threshold analysis
+# 20. Calibration curves
+# 21. Decile / lift analysis
+# 22. Feature importance comparison
+# 23. Final model selection
+# 24. Refit on complete labelled data
+# 25. Predict 1,502 test physicians
+# 26. Rank top 200 physicians
+# 27. Export predictions.csv
+#
+# RANDOM STATE = 42
+# ================================================================
+
+
+# ================================================================
+# 0. INSTALLATION
+# ================================================================
+# Run this cell once if packages are not installed.
+#
+# !pip install pandas numpy scipy scikit-learn statsmodels
+# !pip install matplotlib seaborn xgboost openpyxl patsy
+
+
+# ================================================================
+# 1. IMPORT LIBRARIES
+# ================================================================
+
+import os
+import re
+import json
+import warnings
+
+warnings.filterwarnings("ignore")
+
+import numpy as np
+import pandas as pd
+
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+from scipy import stats
+from scipy.special import expit
+
+import statsmodels.api as sm
+from statsmodels.stats.outliers_influence import variance_inflation_factor
+
+from sklearn.model_selection import (
+    train_test_split,
+    StratifiedKFold,
+    GridSearchCV
+)
+
+from sklearn.preprocessing import (
+    OneHotEncoder,
+    StandardScaler
+)
+
+from sklearn.impute import SimpleImputer
+
+from sklearn.compose import ColumnTransformer
+
+from sklearn.pipeline import Pipeline
+
+from sklearn.linear_model import LogisticRegression
+
+from sklearn.ensemble import (
+    RandomForestClassifier,
+    GradientBoostingClassifier
+)
+
+from sklearn.cluster import KMeans
+
+from sklearn.metrics import (
+    accuracy_score,
+    balanced_accuracy_score,
+    precision_score,
+    recall_score,
+    f1_score,
+    roc_auc_score,
+    average_precision_score,
+    log_loss,
+    brier_score_loss,
+    matthews_corrcoef,
+    confusion_matrix,
+    classification_report,
+    roc_curve,
+    precision_recall_curve,
+    auc,
+    silhouette_score
+)
+
+from sklearn.inspection import permutation_importance
+
+from sklearn.calibration import calibration_curve
+
+from sklearn.base import clone
+
+
+# ================================================================
+# XGBOOST
+# ================================================================
+
+try:
+
+    from xgboost import XGBClassifier
+
+    XGB_AVAILABLE = True
+
+    print("XGBoost available.")
+
+except:
+
+    XGB_AVAILABLE = False
+
+    print("XGBoost not available.")
+    print("Using sklearn GradientBoostingClassifier instead.")
+
+
+# ================================================================
+# 2. GLOBAL SETTINGS
+# ================================================================
+
+RANDOM_STATE = 42
+
+TEST_SIZE = 0.20
+
+DEFAULT_THRESHOLD = 0.50
+
+TOP_N = 200
+
+N_JOBS = -1
+
+
+# ================================================================
+# 3. DATA PATH
+# ================================================================
+#
+# Put these files in the same directory as your notebook:
+#
+# input_data_file1.csv
+# input_data_file2.csv
+# test_physicians.csv
+#
+# If using another directory, change DATA_DIR.
+# ================================================================
+
+DATA_DIR = "."
+
+FILE1 = os.path.join(
+    DATA_DIR,
+    "input_data_file1.csv"
+)
+
+FILE2 = os.path.join(
+    DATA_DIR,
+    "input_data_file2.csv"
+)
+
+TEST_FILE = os.path.join(
+    DATA_DIR,
+    "test_physicians.csv"
+)
+
+
+# ================================================================
+# 4. OUTPUT DIRECTORIES
+# ================================================================
+
+OUTPUT_DIR = "outputs"
+
+FIGURE_DIR = os.path.join(
+    OUTPUT_DIR,
+    "figures"
+)
+
+TABLE_DIR = os.path.join(
+    OUTPUT_DIR,
+    "tables"
+)
+
+os.makedirs(
+    OUTPUT_DIR,
+    exist_ok=True
+)
+
+os.makedirs(
+    FIGURE_DIR,
+    exist_ok=True
+)
+
+os.makedirs(
+    TABLE_DIR,
+    exist_ok=True
+)
+
+
+# ================================================================
+# 5. HELPER FUNCTION
+# ================================================================
+
+def save_plot(filename):
+
+    path = os.path.join(
+        FIGURE_DIR,
+        filename
+    )
+
+    plt.savefig(
+        path,
+        dpi=200,
+        bbox_inches="tight"
+    )
+
+    plt.show()
+
+    plt.close()
+
+
+# ================================================================
+# 6. LOAD DATA
+# ================================================================
+
+print("=" * 80)
+print("LOADING DATA")
+print("=" * 80)
+
+behavior = pd.read_csv(FILE1)
+
+static = pd.read_csv(FILE2)
+
+test_physicians = pd.read_csv(TEST_FILE)
+
+
+print("\nBehavioral data shape:")
+print(behavior.shape)
+
+print("\nStatic data shape:")
+print(static.shape)
+
+print("\nTest data shape:")
+print(test_physicians.shape)
+
+
+# ================================================================
+# 7. BASIC DATA INSPECTION
+# ================================================================
+
+print("\n" + "=" * 80)
+print("BEHAVIOURAL DATA")
+print("=" * 80)
+
+print(behavior.head())
+
+print("\nColumns:")
+print(behavior.columns.tolist())
+
+print("\nData types:")
+print(behavior.dtypes)
+
+print("\nMissing values:")
+print(behavior.isnull().sum())
+
+
+print("\n" + "=" * 80)
+print("STATIC DATA")
+print("=" * 80)
+
+print(static.head())
+
+print("\nColumns:")
+print(static.columns.tolist())
+
+print("\nMissing values:")
+print(static.isnull().sum())
+
+
+print("\n" + "=" * 80)
+print("TEST PHYSICIANS")
+print("=" * 80)
+
+print(test_physicians.head())
+
+print("\nNumber of test physicians:")
+print(test_physicians["physician_id"].nunique())
+
+
+# ================================================================
+# 8. STANDARDIZE COLUMN NAMES
+# ================================================================
+
+behavior.columns = behavior.columns.str.strip()
+
+static.columns = static.columns.str.strip()
+
+test_physicians.columns = test_physicians.columns.str.strip()
+
+
+# ================================================================
+# 9. CONVERT NUMERIC VARIABLES
+# ================================================================
+
+numeric_behavior = [
+    "rx_count",
+    "rep_calls",
+    "samples_provided",
+    "digital_engagements",
+    "speaker_program_attendance",
+    "congress_attendance",
+    "competitive_rx_count",
+    "peer_network_score",
+    "medical_education_events"
+]
+
+numeric_static = [
+    "years_in_practice",
+    "hcp_decile",
+    "payer_access_score",
+    "kol_flag",
+    "hospital_affiliation",
+    "board_certified"
+]
+
+
+for col in numeric_behavior:
+
+    if col in behavior.columns:
+
+        behavior[col] = pd.to_numeric(
+            behavior[col],
+            errors="coerce"
+        )
+
+
+for col in numeric_static:
+
+    if col in static.columns:
+
+        static[col] = pd.to_numeric(
+            static[col],
+            errors="coerce"
+        )
+
+
+# ================================================================
+# 10. QUARTER ORDERING
+# ================================================================
+
+def extract_quarter_number(x):
+
+    match = re.search(
+        r"(\d+)",
+        str(x)
+    )
+
+    if match:
+
+        return int(match.group(1))
+
+    return np.nan
+
+
+behavior["quarter_num"] = (
+    behavior["quarter"]
+    .apply(extract_quarter_number)
+)
+
+
+behavior = behavior.sort_values(
+    [
+        "physician_id",
+        "quarter_num"
+    ]
+)
+
+
+# ================================================================
+# 11. TARGET DEFINITION
+# ================================================================
+#
+# adopted = 1 if physician prescribed Drug XYZ
+# in ANY historical quarter Q1-Q10.
+#
+# adopted = 0 otherwise.
+# ================================================================
+
+adoption_labels = (
+
+    behavior
+    .groupby("physician_id")["rx_count"]
+    .max()
+    .gt(0)
+    .astype(int)
+    .rename("adopted")
+
+)
+
+
+print("\nHistorical adoption counts:")
+
+print(
+    adoption_labels.value_counts()
+)
+
+
+print("\nHistorical adoption percentages:")
+
+print(
+    adoption_labels.value_counts(
+        normalize=True
+    ) * 100
+)
+
+
+# ================================================================
+# 12. MERGE LONGITUDINAL + STATIC DATA
+# ================================================================
+
+df = behavior.merge(
+    static,
+    on="physician_id",
+    how="left",
+    validate="many_to_one"
+)
+
+
+df["adopted"] = (
+    df["physician_id"]
+    .map(adoption_labels)
+)
+
+
+print("\nMerged data shape:")
+
+print(df.shape)
+
+
+# ================================================================
+# 13. IDENTIFY TEST PHYSICIANS
+# ================================================================
+
+test_ids = set(
+    test_physicians[
+        "physician_id"
+    ]
+)
+
+
+df["is_test"] = (
+    df["physician_id"]
+    .isin(test_ids)
+    .astype(int)
+)
+
+
+# ================================================================
+# 14. VERIFY TEST SET
+# ================================================================
+
+test_adoption_check = (
+    df[df["is_test"] == 1]
+    .groupby("physician_id")["rx_count"]
+    .max()
+)
+
+
+print("\nTest physician count:")
+
+print(
+    len(test_adoption_check)
+)
+
+
+print("\nMaximum historical Rx among test physicians:")
+
+print(
+    test_adoption_check.max()
+)
+
+
+# ================================================================
+# 15. EDA — CLASS BALANCE
+# ================================================================
+
+class_balance = (
+
+    adoption_labels
+    .value_counts()
+    .rename_axis("adopted")
+    .reset_index(
+        name="count"
+    )
+
+)
+
+class_balance["percentage"] = (
+
+    class_balance["count"]
+    /
+    class_balance["count"].sum()
+    *
+    100
+
+)
+
+
+print(
+    class_balance
+)
+
+
+class_balance.to_csv(
+    os.path.join(
+        TABLE_DIR,
+        "class_balance.csv"
+    ),
+    index=False
+)
+
+
+plt.figure(
+    figsize=(7,5)
+)
+
+sns.barplot(
+    data=class_balance,
+    x="adopted",
+    y="count"
+)
+
+plt.title(
+    "Historical Adoption Class Balance"
+)
+
+plt.xlabel(
+    "Adoption Status"
+)
+
+plt.ylabel(
+    "Number of Physicians"
+)
+
+plt.xticks(
+    [0,1],
+    [
+        "Non-Adopter",
+        "Adopter"
+    ]
+)
+
+save_plot(
+    "01_class_balance.png"
+)
+
+
+# ================================================================
+# 16. EDA — MISSING VALUES
+# ================================================================
+
+missing_summary = (
+
+    df
+    .isnull()
+    .mean()
+    .sort_values(
+        ascending=False
+    )
+    * 100
+)
+
+missing_summary = (
+    missing_summary
+    .rename("missing_percentage")
+    .reset_index()
+)
+
+missing_summary.columns = [
+    "feature",
+    "missing_percentage"
+]
+
+
+missing_summary.to_csv(
+    os.path.join(
+        TABLE_DIR,
+        "missing_values.csv"
+    ),
+    index=False
+)
+
+
+print("\nMissing value summary:")
+
+print(
+    missing_summary[
+        missing_summary["missing_percentage"] > 0
+    ]
+)
+
+
+missing_plot = (
+    missing_summary[
+        missing_summary[
+            "missing_percentage"
+        ] > 0
+    ]
+)
+
+
+if len(missing_plot) > 0:
+
+    plt.figure(
+        figsize=(10,6)
+    )
+
+    sns.barplot(
+        data=missing_plot,
+        x="missing_percentage",
+        y="feature"
+    )
+
+    plt.title(
+        "Missing Values by Feature"
+    )
+
+    plt.xlabel(
+        "Missing Percentage"
+    )
+
+    save_plot(
+        "02_missing_values.png"
+    )
+
+
+# ================================================================
+# 17. EDA — DESCRIPTIVE STATISTICS
+# ================================================================
+
+print("\nDescriptive statistics:")
+
+print(
+    df.describe(
+        include="all"
+    ).T
+)
+
+
+df.describe(
+    include="all"
+).T.to_csv(
+    os.path.join(
+        TABLE_DIR,
+        "descriptive_statistics.csv"
+    )
+)
+
+
+# ================================================================
+# 18. EDA — OUTLIER DETECTION USING IQR
+# ================================================================
+
+outlier_rows = []
+
+
+for col in numeric_behavior:
+
+    if col not in df.columns:
+
+        continue
+
+    x = df[col].dropna()
+
+    Q1 = x.quantile(0.25)
+
+    Q3 = x.quantile(0.75)
+
+    IQR = Q3 - Q1
+
+    lower = Q1 - 1.5 * IQR
+
+    upper = Q3 + 1.5 * IQR
+
+    outliers = (
+        (x < lower)
+        |
+        (x > upper)
+    ).sum()
+
+    outlier_rows.append({
+
+        "feature": col,
+
+        "Q1": Q1,
+
+        "Q3": Q3,
+
+        "IQR": IQR,
+
+        "lower_bound": lower,
+
+        "upper_bound": upper,
+
+        "outlier_count": outliers,
+
+        "outlier_percentage":
+            100 * outliers / len(x)
+
+    })
+
+
+outlier_summary = pd.DataFrame(
+    outlier_rows
+)
+
+
+outlier_summary.to_csv(
+    os.path.join(
+        TABLE_DIR,
+        "outlier_summary.csv"
+    ),
+    index=False
+)
+
+
+print(
+    outlier_summary.sort_values(
+        "outlier_percentage",
+        ascending=False
+    )
+)
+
+
+# ================================================================
+# 19. EDA — DISTRIBUTIONS
+# ================================================================
+
+for col in numeric_behavior:
+
+    if col not in df.columns:
+
+        continue
+
+    plt.figure(
+        figsize=(8,5)
+    )
+
+    sns.histplot(
+        data=df,
+        x=col,
+        hue="adopted",
+        kde=True,
+        bins=30,
+        element="step"
+    )
+
+    plt.title(
+        f"{col} Distribution by Adoption"
+    )
+
+    save_plot(
+        f"03_distribution_{col}.png"
+    )
+
+
+# ================================================================
+# 20. EDA — BOX PLOTS
+# ================================================================
+
+for col in numeric_behavior:
+
+    if col not in df.columns:
+
+        continue
+
+    plt.figure(
+        figsize=(8,5)
+    )
+
+    sns.boxplot(
+        data=df,
+        x="adopted",
+        y=col
+    )
+
+    plt.title(
+        f"{col} by Adoption Status"
+    )
+
+    plt.xlabel(
+        "Adoption"
+    )
+
+    plt.ylabel(
+        col
+    )
+
+    save_plot(
+        f"04_boxplot_{col}.png"
+    )
+
+
+# ================================================================
+# 21. EDA — SPECIALTY
+# ================================================================
+
+specialty_summary = (
+
+    df
+    .groupby("specialty")["adopted"]
+    .agg(
+        [
+            "count",
+            "mean",
+            "sum"
+        ]
+    )
+
+    .rename(
+        columns={
+            "count": "n",
+            "mean": "adoption_rate",
+            "sum": "adopters"
+        }
+    )
+
+)
+
+specialty_summary[
+    "adoption_rate_pct"
+] = (
+    specialty_summary[
+        "adoption_rate"
+    ] * 100
+)
+
+
+print(
+    specialty_summary
+)
+
+
+specialty_summary.to_csv(
+    os.path.join(
+        TABLE_DIR,
+        "specialty_adoption.csv"
+    )
+)
+
+
+plt.figure(
+    figsize=(9,5)
+)
+
+sns.barplot(
+    x=specialty_summary[
+        "adoption_rate_pct"
+    ],
+    y=specialty_summary.index
+)
+
+plt.title(
+    "Adoption Rate by Specialty"
+)
+
+plt.xlabel(
+    "Adoption Rate (%)"
+)
+
+plt.ylabel(
+    "Specialty"
+)
+
+save_plot(
+    "05_specialty_adoption.png"
+)
+
+
+# ================================================================
+# 22. EDA — GEOGRAPHIC REGION
+# ================================================================
+
+region_summary = (
+
+    df
+    .groupby("geographic_region")["adopted"]
+    .agg(
+        [
+            "count",
+            "mean",
+            "sum"
+        ]
+    )
+
+    .rename(
+        columns={
+            "count": "n",
+            "mean": "adoption_rate",
+            "sum": "adopters"
+        }
+    )
+
+)
+
+region_summary[
+    "adoption_rate_pct"
+] = (
+    region_summary[
+        "adoption_rate"
+    ] * 100
+)
+
+
+region_summary.to_csv(
+    os.path.join(
+        TABLE_DIR,
+        "region_adoption.csv"
+    )
+)
+
+
+plt.figure(
+    figsize=(9,5)
+)
+
+sns.barplot(
+    x=region_summary[
+        "adoption_rate_pct"
+    ],
+    y=region_summary.index
+)
+
+plt.title(
+    "Adoption Rate by Geographic Region"
+)
+
+plt.xlabel(
+    "Adoption Rate (%)"
+)
+
+plt.ylabel(
+    "Region"
+)
+
+save_plot(
+    "06_region_adoption.png"
+)
+
+
+# ================================================================
+# 23. EDA — PRACTICE TYPE
+# ================================================================
+
+practice_summary = (
+
+    df
+    .groupby("practice_type")["adopted"]
+    .mean()
+    .sort_values(
+        ascending=False
+    )
+    * 100
+)
+
+print(
+    practice_summary
+)
+
+
+plt.figure(
+    figsize=(9,5)
+)
+
+sns.barplot(
+    x=practice_summary.values,
+    y=practice_summary.index
+)
+
+plt.title(
+    "Adoption Rate by Practice Type"
+)
+
+plt.xlabel(
+    "Adoption Rate (%)"
+)
+
+plt.ylabel(
+    "Practice Type"
+)
+
+save_plot(
+    "07_practice_type_adoption.png"
+)
+
+
+# ================================================================
+# 24. EDA — CORRELATION MATRIX
+# ================================================================
+
+correlation_columns = [
+
+    "rx_count",
+
+    "rep_calls",
+
+    "samples_provided",
+
+    "digital_engagements",
+
+    "speaker_program_attendance",
+
+    "congress_attendance",
+
+    "competitive_rx_count",
+
+    "peer_network_score",
+
+    "medical_education_events",
+
+    "years_in_practice",
+
+    "hcp_decile",
+
+    "payer_access_score",
+
+    "kol_flag",
+
+    "hospital_affiliation",
+
+    "board_certified"
+
+]
+
+
+correlation_columns = [
+
+    c for c in correlation_columns
+    if c in df.columns
+
+]
+
+
+correlation_matrix = (
+
+    df[
+        correlation_columns
+    ]
+
+    .corr()
+
+)
+
+
+correlation_matrix.to_csv(
+    os.path.join(
+        TABLE_DIR,
+        "correlation_matrix.csv"
+    )
+)
+
+
+plt.figure(
+    figsize=(14,10)
+)
+
+sns.heatmap(
+    correlation_matrix,
+    annot=True,
+    fmt=".2f",
+    cmap="coolwarm",
+    center=0
+)
+
+plt.title(
+    "Correlation Matrix"
+)
+
+save_plot(
+    "08_correlation_matrix.png"
+)
+
+
+# ================================================================
+# 25. QUARTERLY ACTIVITY ANALYSIS
+# ================================================================
+
+quarterly_variables = [
+
+    "rep_calls",
+
+    "samples_provided",
+
+    "digital_engagements",
+
+    "competitive_rx_count",
+
+    "peer_network_score",
+
+    "speaker_program_attendance",
+
+    "congress_attendance",
+
+    "medical_education_events"
+
+]
+
+
+quarterly_means = (
+
+    df
+    .groupby("quarter_num")[
+        quarterly_variables
+    ]
+
+    .mean()
+
+)
+
+
+quarterly_means.to_csv(
+    os.path.join(
+        TABLE_DIR,
+        "quarterly_activity_means.csv"
+    )
+)
+
+
+for col in quarterly_variables:
+
+    plt.figure(
+        figsize=(9,5)
+    )
+
+    sns.lineplot(
+        x=quarterly_means.index,
+        y=quarterly_means[col],
+        marker="o"
+    )
+
+    plt.title(
+        f"Quarterly Mean - {col}"
+    )
+
+    plt.xlabel(
+        "Quarter"
+    )
+
+    plt.ylabel(
+        "Mean"
+    )
+
+    save_plot(
+        f"09_quarterly_{col}.png"
+    )
+
+
+# ================================================================
+# 26. OLS REGRESSION
+# ================================================================
+#
+# Assignment specifically requests OLS using:
+#
+# rep_calls
+# samples_provided
+# digital_engagements
+#
+# aggregated at physician level.
+# ================================================================
+
+ols_features = [
+
+    "rep_calls",
+
+    "samples_provided",
+
+    "digital_engagements"
+
+]
+
+
+ols_data = (
+
+    df
+    .groupby("physician_id")[
+        ols_features
+    ]
+
+    .sum()
+
+    .join(adoption_labels)
+
+)
+
+
+X_ols = (
+
+    ols_data[
+        ols_features
+    ]
+
+    .fillna(
+        ols_data[
+            ols_features
+        ].median()
+    )
+
+)
+
+
+X_ols = sm.add_constant(
+    X_ols
+)
+
+
+y_ols = ols_data[
+    "adopted"
+]
+
+
+ols_model = sm.OLS(
+    y_ols,
+    X_ols
+).fit()
+
+
+print("\n")
+print("=" * 80)
+print("OLS REGRESSION RESULTS")
+print("=" * 80)
+
+print(
+    ols_model.summary()
+)
+
+
+with open(
+    os.path.join(
+        TABLE_DIR,
+        "OLS_summary.txt"
+    ),
+    "w"
+) as f:
+
+    f.write(
+        ols_model.summary()
+        .as_text()
+    )
+
+
+# ================================================================
+# 27. FEATURE ENGINEERING FUNCTION
+# ================================================================
+
+def engineer_features(
+    behavioral_data,
+    static_data
+):
+
+    data = behavioral_data.copy()
+
+    data = data.sort_values(
+        [
+            "physician_id",
+            "quarter_num"
+        ]
+    )
+
+
+    rows = []
+
+
+    variables = [
+
+        "rep_calls",
+
+        "samples_provided",
+
+        "digital_engagements",
+
+        "speaker_program_attendance",
+
+        "congress_attendance",
+
+        "competitive_rx_count",
+
+        "peer_network_score",
+
+        "medical_education_events"
+
+    ]
+
+
+    for physician_id, group in data.groupby(
+        "physician_id"
+    ):
+
+        group = group.sort_values(
+            "quarter_num"
+        )
+
+
+        row = {
+
+            "physician_id":
+                physician_id
+
+        }
+
+
+        # --------------------------------------------------------
+        # TOTAL FEATURES
+        # --------------------------------------------------------
+
+        for col in variables:
+
+            series = pd.to_numeric(
+                group[col],
+                errors="coerce"
+            )
+
+            row[
+                f"{col}_total"
+            ] = series.sum()
+
+            row[
+                f"{col}_mean"
+            ] = series.mean()
+
+            row[
+                f"{col}_std"
+            ] = series.std()
+
+            row[
+                f"{col}_last"
+            ] = series.iloc[-1]
+
+
+        # --------------------------------------------------------
+        # EARLY WINDOW Q1-Q3
+        # --------------------------------------------------------
+
+        early = group[
+            group["quarter_num"].isin(
+                [1,2,3]
+            )
+        ]
+
+
+        # --------------------------------------------------------
+        # RECENT WINDOW Q8-Q10
+        # --------------------------------------------------------
+
+        recent = group[
+            group["quarter_num"].isin(
+                [8,9,10]
+            )
+        ]
+
+
+        for col in variables:
+
+            early_mean = (
+                early[col]
+                .mean()
+            )
+
+            recent_mean = (
+                recent[col]
+                .mean()
+            )
+
+
+            row[
+                f"{col}_early_mean"
+            ] = early_mean
+
+
+            row[
+                f"{col}_recent_mean"
+            ] = recent_mean
+
+
+            # ----------------------------------------------------
+            # TREND
+            # ----------------------------------------------------
+
+            row[
+                f"{col}_trend"
+            ] = (
+                recent_mean
+                -
+                early_mean
+            )
+
+
+        # --------------------------------------------------------
+        # SPEAKER PROGRAM RECENCY
+        # --------------------------------------------------------
+
+        row[
+            "speaker_recency_Q8_Q10"
+        ] = (
+
+            recent[
+                "speaker_program_attendance"
+            ]
+
+            .sum()
+
+        )
+
+
+        # --------------------------------------------------------
+        # CONGRESS RECENCY
+        # --------------------------------------------------------
+
+        row[
+            "congress_recency_Q8_Q10"
+        ] = (
+
+            recent[
+                "congress_attendance"
+            ]
+
+            .sum()
+
+        )
+
+
+        # --------------------------------------------------------
+        # MONOTONIC MOMENTUM - LAST 4 QUARTERS
+        # --------------------------------------------------------
+
+        last4 = group[
+            group["quarter_num"].isin(
+                [7,8,9,10]
+            )
+        ].sort_values(
+            "quarter_num"
+        )
+
+
+        for col in [
+
+            "rep_calls",
+
+            "samples_provided",
+
+            "digital_engagements",
+
+            "competitive_rx_count",
+
+            "peer_network_score"
+
+        ]:
+
+            values = (
+                last4[col]
+                .dropna()
+                .values
+            )
+
+
+            if len(values) >= 2:
+
+                row[
+                    f"{col}_monotonic_last4"
+                ] = int(
+                    np.all(
+                        np.diff(values) >= 0
+                    )
+                    and
+                    np.any(
+                        np.diff(values) > 0
+                    )
+                )
+
+            else:
+
+                row[
+                    f"{col}_monotonic_last4"
+                ] = 0
+
+
+        # --------------------------------------------------------
+        # RECENT LINEAR SLOPE
+        # --------------------------------------------------------
+
+        for col in [
+
+            "rep_calls",
+
+            "samples_provided",
+
+            "digital_engagements",
+
+            "competitive_rx_count",
+
+            "peer_network_score"
+
+        ]:
+
+            temp = recent[
+                [
+                    "quarter_num",
+                    col
+                ]
+            ].dropna()
+
+
+            if len(temp) >= 2:
+
+                slope = np.polyfit(
+                    temp[
+                        "quarter_num"
+                    ],
+                    temp[col],
+                    1
+                )[0]
+
+            else:
+
+                slope = np.nan
+
+
+            row[
+                f"{col}_recent_slope"
+            ] = slope
+
+
+        rows.append(
+            row
+        )
+
+
+    engineered = pd.DataFrame(
+        rows
+    )
+
+
+    engineered = engineered.merge(
+        static_data.drop_duplicates(
+            "physician_id"
+        ),
+        on="physician_id",
+        how="left",
+        validate="one_to_one"
+    )
+
+
+    return engineered
+
+
+# ================================================================
+# 28. CREATE ENGINEERED DATASET
+# ================================================================
+
+physician_features = engineer_features(
+    behavior,
+    static
+)
+
+
+physician_features = physician_features.merge(
+    adoption_labels,
+    on="physician_id",
+    how="left"
+)
+
+
+physician_features["is_test"] = (
+    physician_features[
+        "physician_id"
+    ]
+    .isin(test_ids)
+    .astype(int)
+)
+
+
+print("\nEngineered dataset shape:")
+
+print(
+    physician_features.shape
+)
+
+
+print("\nEngineered features:")
+
+print(
+    physician_features.columns.tolist()
+)
+
+
+# ================================================================
+# 29. TRAIN / VALIDATION SPLIT
+# ================================================================
+
+labelled_data = physician_features[
+    physician_features["is_test"] == 0
+].copy()
+
+
+train_data, valid_data = train_test_split(
+
+    labelled_data,
+
+    test_size=TEST_SIZE,
+
+    stratify=labelled_data[
+        "adopted"
+    ],
+
+    random_state=RANDOM_STATE
+
+)
+
+
+print(
+    "\nTraining physicians:",
+    len(train_data)
+)
+
+print(
+    "Validation physicians:",
+    len(valid_data)
+)
+
+
+# ================================================================
+# 30. K-MEANS BEHAVIOURAL SEGMENTATION
+# ================================================================
+
+cluster_features = [
+
+    c for c in physician_features.columns
+
+    if (
+        c.endswith("_total")
+        or
+        c.endswith("_recent_mean")
+        or
+        c.endswith("_trend")
+    )
+
+]
+
+
+cluster_features = [
+
+    c for c in cluster_features
+
+    if "rx_count" not in c
+
+]
+
+
+cluster_features = [
+
+    c for c in cluster_features
+
+    if pd.api.types.is_numeric_dtype(
+        physician_features[c]
+    )
+
+]
+
+
+cluster_medians = (
+    train_data[
+        cluster_features
+    ]
+    .median()
+)
+
+
+X_cluster_train = (
+    train_data[
+        cluster_features
+    ]
+    .fillna(
+        cluster_medians
+    )
+)
+
+
+cluster_scaler = StandardScaler()
+
+
+X_cluster_train_scaled = (
+    cluster_scaler.fit_transform(
+        X_cluster_train
+    )
+)
+
+
+silhouette_results = []
+
+
+cluster_models = {}
+
+
+for k in [4,5,6]:
+
+    kmeans = KMeans(
+
+        n_clusters=k,
+
+        random_state=RANDOM_STATE,
+
+        n_init=20
+
+    )
+
+
+    labels = kmeans.fit_predict(
+        X_cluster_train_scaled
+    )
+
+
+    score = silhouette_score(
+
+        X_cluster_train_scaled,
+
+        labels
+
+    )
+
+
+    silhouette_results.append({
+
+        "k": k,
+
+        "silhouette_score": score
+
+    })
+
+
+    cluster_models[k] = kmeans
+
+
+silhouette_df = pd.DataFrame(
+    silhouette_results
+)
+
+
+print("\nK-Means silhouette results:")
+
+print(
+    silhouette_df
+)
+
+
+silhouette_df.to_csv(
+    os.path.join(
+        TABLE_DIR,
+        "kmeans_silhouette.csv"
+    ),
+    index=False
+)
+
+
+best_k = int(
+
+    silhouette_df.loc[
+        silhouette_df[
+            "silhouette_score"
+        ].idxmax(),
+        "k"
+    ]
+
+)
+
+
+best_kmeans = cluster_models[
+    best_k
+]
+
+
+X_cluster_all = (
+
+    physician_features[
+        cluster_features
+    ]
+
+    .fillna(
+        cluster_medians
+    )
+
+)
+
+
+X_cluster_all_scaled = (
+    cluster_scaler.transform(
+        X_cluster_all
+    )
+)
+
+
+physician_features[
+    "behaviour_cluster"
+] = (
+
+    best_kmeans
+    .predict(
+        X_cluster_all_scaled
+    )
+    .astype(str)
+
+)
+
+
+print(
+    "\nSelected K:",
+    best_k
+)
+
+
+plt.figure(
+    figsize=(8,5)
+)
+
+sns.lineplot(
+    data=silhouette_df,
+    x="k",
+    y="silhouette_score",
+    marker="o"
+)
+
+plt.title(
+    "K-Means Cluster Selection"
+)
+
+plt.xlabel(
+    "Number of Clusters"
+)
+
+plt.ylabel(
+    "Silhouette Score"
+)
+
+save_plot(
+    "10_kmeans_silhouette.png"
+)
+
+
+# ================================================================
+# 31. CLUSTER ADOPTION ANALYSIS
+# ================================================================
+
+cluster_adoption = (
+
+    physician_features[
+        physician_features[
+            "is_test"
+        ] == 0
+    ]
+
+    .groupby(
+        "behaviour_cluster"
+    )["adopted"]
+
+    .agg(
+        [
+            "count",
+            "mean",
+            "sum"
+        ]
+    )
+
+)
+
+
+cluster_adoption[
+    "adoption_rate_pct"
+] = (
+
+    cluster_adoption[
+        "mean"
+    ]
+
+    * 100
+
+)
+
+
+print(
+    cluster_adoption
+)
+
+
+cluster_adoption.to_csv(
+    os.path.join(
+        TABLE_DIR,
+        "cluster_adoption.csv"
+    )
+)
+
+
+plt.figure(
+    figsize=(8,5)
+)
+
+sns.barplot(
+    x=cluster_adoption.index,
+    y=cluster_adoption[
+        "adoption_rate_pct"
+    ]
+)
+
+plt.title(
+    "Adoption Rate by Behaviour Cluster"
+)
+
+plt.xlabel(
+    "Behaviour Cluster"
+)
+
+plt.ylabel(
+    "Adoption Rate (%)"
+)
+
+save_plot(
+    "11_cluster_adoption.png"
+)
+
+
+# ================================================================
+# 32. TERRITORY-LEVEL FEATURES
+# ================================================================
+
+territory_features = (
+
+    df
+    .groupby(
+        "territory_code"
+    )
+
+    .agg(
+
+        territory_avg_rep_calls=(
+            "rep_calls",
+            "mean"
+        ),
+
+        territory_avg_samples=(
+            "samples_provided",
+            "mean"
+        ),
+
+        territory_avg_digital=(
+            "digital_engagements",
+            "mean"
+        ),
+
+        territory_avg_competitive_rx=(
+            "competitive_rx_count",
+            "mean"
+        ),
+
+        territory_avg_peer_score=(
+            "peer_network_score",
+            "mean"
+        )
+
+    )
+
+    .reset_index()
+
+)
+
+
+physician_features = physician_features.merge(
+
+    territory_features,
+
+    on="territory_code",
+
+    how="left"
+
+)
+
+
+# ================================================================
+# 33. TERRITORY ADOPTION RATE
+# ================================================================
+#
+# Target encoding must be calculated using TRAINING data only
+# to prevent leakage.
+# ================================================================
+
+global_adoption_rate = (
+    train_data[
+        "adopted"
+    ].mean()
+)
+
+
+territory_train_stats = (
+
+    train_data
+    .groupby(
+        "territory_code"
+    )["adopted"]
+
+    .agg(
+        [
+            "sum",
+            "count"
+        ]
+    )
+
+)
+
+
+SMOOTHING_ALPHA = 20
+
+
+territory_train_stats[
+    "territory_adoption_rate"
+] = (
+
+    territory_train_stats[
+        "sum"
+    ]
+
+    +
+
+    SMOOTHING_ALPHA
+    *
+    global_adoption_rate
+
+) / (
+
+    territory_train_stats[
+        "count"
+    ]
+
+    +
+
+    SMOOTHING_ALPHA
+
+)
+
+
+territory_map = territory_train_stats[
+    "territory_adoption_rate"
+].to_dict()
+
+
+# ================================================================
+# 34. LEAKAGE-SAFE TERRITORY RATE
+# ================================================================
+
+def calculate_loo_territory_rate(
+    row
+):
+
+    territory = row[
+        "territory_code"
+    ]
+
+
+    if territory not in territory_train_stats.index:
+
+        return global_adoption_rate
+
+
+    total_n = territory_train_stats.loc[
+        territory,
+        "count"
+    ]
+
+
+    total_adopters = territory_train_stats.loc[
+        territory,
+        "sum"
+    ]
+
+
+    n_without_current = (
+        total_n - 1
+    )
+
+
+    adopters_without_current = (
+
+        total_adopters
+        -
+        row["adopted"]
+
+    )
+
+
+    return (
+
+        adopters_without_current
+        +
+        SMOOTHING_ALPHA
+        *
+        global_adoption_rate
+
+    ) / (
+
+        n_without_current
+        +
+        SMOOTHING_ALPHA
+
+    )
+
+
+train_data[
+    "territory_adoption_rate"
+] = train_data.apply(
+    calculate_loo_territory_rate,
+    axis=1
+)
+
+
+valid_data[
+    "territory_adoption_rate"
+] = (
+
+    valid_data[
+        "territory_code"
+    ]
+
+    .map(
+        territory_map
+    )
+
+    .fillna(
+        global_adoption_rate
+    )
+
+)
+
+
+test_data = physician_features[
+    physician_features[
+        "is_test"
+    ] == 1
+].copy()
+
+
+test_data[
+    "territory_adoption_rate"
+] = (
+
+    test_data[
+        "territory_code"
+    ]
+
+    .map(
+        territory_map
+    )
+
+    .fillna(
+        global_adoption_rate
+    )
+
+)
+
+
+# ================================================================
+# 35. TERRITORY ADOPTION RATE ANALYSIS
+# ================================================================
+
+territory_rates = (
+
+    labelled_data
+    .groupby(
+        "territory_code"
+    )["adopted"]
+
+    .agg(
+        [
+            "count",
+            "mean"
+        ]
+    )
+
+)
+
+
+territory_rates[
+    "adoption_rate_pct"
+] = (
+
+    territory_rates[
+        "mean"
+    ]
+
+    * 100
+
+)
+
+
+territory_rates.to_csv(
+    os.path.join(
+        TABLE_DIR,
+        "territory_adoption_rates.csv"
+    )
+)
+
+
+print("\nTerritory adoption rates:")
+
+print(
+    territory_rates.sort_values(
+        "mean",
+        ascending=False
+    )
+)
+
+
+plt.figure(
+    figsize=(10,6)
+)
+
+sns.histplot(
+    territory_rates[
+        "mean"
+    ],
+    bins=20,
+    kde=True
+)
+
+plt.title(
+    "Distribution of Territory Adoption Rates"
+)
+
+plt.xlabel(
+    "Adoption Rate"
+)
+
+save_plot(
+    "12_territory_adoption_distribution.png"
+)
+
+
+# ================================================================
+# 36. DEFINE MODEL FEATURES
+# ================================================================
+
+DROP_FEATURES = [
+
+    "physician_id",
+
+    "adopted",
+
+    "is_test",
+
+    "rx_count",
+
+    "quarter_num"
+
+]
+
+
+all_features = [
+
+    c for c in physician_features.columns
+
+    if c not in DROP_FEATURES
+
+]
+
+
+# Remove raw target-derived Rx features.
+#
+# Test physicians have zero historical Rx by definition.
+# Including historical Rx as a predictor would therefore create
+# a trivial / inappropriate signal.
+# ================================================================
+
+all_features = [
+
+    c for c in all_features
+
+    if not c.startswith(
+        "rx_count_"
+    )
+
+]
+
+
+numeric_features = [
+
+    c for c in all_features
+
+    if pd.api.types.is_numeric_dtype(
+        physician_features[c]
+    )
+
+]
+
+
+categorical_features = [
+
+    c for c in all_features
+
+    if c not in numeric_features
+
+]
+
+
+print(
+    "\nNumeric feature count:",
+    len(numeric_features)
+)
+
+print(
+    "Categorical feature count:",
+    len(categorical_features)
+)
+
+
+# ================================================================
+# 37. VIF ANALYSIS
+# ================================================================
+
+vif_candidates = [
+
+    c for c in numeric_features
+
+    if physician_features[
+        c
+    ].nunique(
+        dropna=True
+    ) > 2
+
+]
+
+
+vif_data = train_data[
+    vif_candidates
+].copy()
+
+
+vif_data = vif_data.fillna(
+    vif_data.median()
+)
+
+
+vif_rows = []
+
+
+for i, col in enumerate(
+    vif_data.columns
+):
+
+    try:
+
+        value = variance_inflation_factor(
+
+            vif_data.values,
+
+            i
+
+        )
+
+    except:
+
+        value = np.inf
+
+
+    vif_rows.append({
+
+        "feature": col,
+
+        "VIF": value
+
+    })
+
+
+vif_before = pd.DataFrame(
+    vif_rows
+).sort_values(
+    "VIF",
+    ascending=False
+)
+
+
+print("\nVIF before pruning:")
+
+print(
+    vif_before
+)
+
+
+vif_before.to_csv(
+    os.path.join(
+        TABLE_DIR,
+        "VIF_before_pruning.csv"
+    ),
+    index=False
+)
+
+
+# ================================================================
+# 38. ITERATIVE VIF PRUNING
+# ================================================================
+
+vif_features = vif_candidates.copy()
+
+vif_history = []
+
+
+while len(vif_features) > 2:
+
+    temp = train_data[
+        vif_features
+    ].copy()
+
+    temp = temp.fillna(
+        temp.median()
+    )
+
+    values = []
+
+    for i, col in enumerate(
+        temp.columns
+    ):
+
+        try:
+
+            vif = variance_inflation_factor(
+                temp.values,
+                i
+            )
+
+        except:
+
+            vif = np.inf
+
+        values.append(
+            vif
+        )
+
+
+    vif_df = pd.DataFrame({
+
+        "feature":
+            temp.columns,
+
+        "VIF":
+            values
+
+    })
+
+
+    max_vif = vif_df[
+        "VIF"
+    ].max()
+
+
+    if max_vif <= 10:
+
+        break
+
+
+    worst_feature = (
+
+        vif_df
+        .sort_values(
+            "VIF",
+            ascending=False
+        )
+        .iloc[0]["feature"]
+
+    )
+
+
+    vif_history.append({
+
+        "removed_feature":
+            worst_feature,
+
+        "VIF":
+            max_vif
+
+    })
+
+
+    vif_features.remove(
+        worst_feature
+    )
+
+
+vif_after_rows = []
+
+
+temp = train_data[
+    vif_features
+].copy()
+
+
+temp = temp.fillna(
+    temp.median()
+)
+
+
+for i, col in enumerate(
+    temp.columns
+):
+
+    try:
+
+        vif = variance_inflation_factor(
+            temp.values,
+            i
+        )
+
+    except:
+
+        vif = np.inf
+
+
+    vif_after_rows.append({
+
+        "feature": col,
+
+        "VIF": vif
+
+    })
+
+
+vif_after = pd.DataFrame(
+    vif_after_rows
+).sort_values(
+    "VIF",
+    ascending=False
+)
+
+
+print("\nVIF after pruning:")
+
+print(
+    vif_after
+)
+
+
+vif_after.to_csv(
+    os.path.join(
+        TABLE_DIR,
+        "VIF_after_pruning.csv"
+    ),
+    index=False
+)
+
+
+pd.DataFrame(
+    vif_history
+).to_csv(
+    os.path.join(
+        TABLE_DIR,
+        "VIF_pruning_history.csv"
+    ),
+    index=False
+)
+
+
+# ================================================================
+# 39. FINAL NUMERIC FEATURES
+# ================================================================
+
+binary_numeric = [
+
+    c for c in numeric_features
+
+    if c not in vif_candidates
+
+]
+
+
+final_numeric_features = sorted(
+    list(
+        set(
+            vif_features
+            +
+            binary_numeric
+        )
+    )
+)
+
+
+# ================================================================
+# 40. FINAL CATEGORICAL FEATURES
+# ================================================================
+
+final_categorical_features = [
+
+    c for c in categorical_features
+
+    if c in [
+
+        "specialty",
+
+        "practice_type",
+
+        "geographic_region",
+
+        "state",
+
+        "territory_code",
+
+        "practice_size",
+
+        "behaviour_cluster"
+
+    ]
+
+]
+
+
+print(
+    "\nFinal numerical features:"
+)
+
+print(
+    final_numeric_features
+)
+
+
+print(
+    "\nFinal categorical features:"
+)
+
+print(
+    final_categorical_features
+)
+
+
+# ================================================================
+# 41. CREATE MODEL MATRICES
+# ================================================================
+
+X_train = train_data[
+    final_numeric_features
+    +
+    final_categorical_features
+].copy()
+
+
+y_train = train_data[
+    "adopted"
+].astype(int)
+
+
+X_valid = valid_data[
+    final_numeric_features
+    +
+    final_categorical_features
+].copy()
+
+
+y_valid = valid_data[
+    "adopted"
+].astype(int)
+
+
+# ================================================================
+# 42. PREPROCESSING PIPELINE
+# ================================================================
+
+numeric_pipeline = Pipeline(
+
+    steps=[
+
+        (
+            "imputer",
+
+            SimpleImputer(
+                strategy="median"
+            )
+
+        ),
+
+        (
+            "scaler",
+
+            StandardScaler()
+        )
+
+    ]
+
+)
+
+
+categorical_pipeline = Pipeline(
+
+    steps=[
+
+        (
+            "imputer",
+
+            SimpleImputer(
+                strategy="most_frequent"
+            )
+
+        ),
+
+        (
+            "onehot",
+
+            OneHotEncoder(
+                handle_unknown="ignore",
+                sparse_output=False
+            )
+
+        )
+
+    ]
+
+)
+
+
+preprocessor = ColumnTransformer(
+
+    transformers=[
+
+        (
+            "numeric",
+
+            numeric_pipeline,
+
+            final_numeric_features
+
+        ),
+
+        (
+            "categorical",
+
+            categorical_pipeline,
+
+            final_categorical_features
+
+        )
+
+    ],
+
+    remainder="drop",
+
+    verbose_feature_names_out=False
+
+)
+
+
+X_train_processed = (
+    preprocessor.fit_transform(
+        X_train
+    )
+)
+
+
+X_valid_processed = (
+    preprocessor.transform(
+        X_valid
+    )
+)
+
+
+feature_names = (
+    preprocessor
+    .get_feature_names_out()
+)
+
+
+print(
+    "\nProcessed training matrix:",
+    X_train_processed.shape
+)
+
+
+# ================================================================
+# 43. MODEL EVALUATION FUNCTION
+# ================================================================
+
+def calculate_metrics(
+    y_true,
+    probabilities,
+    threshold=0.50
+):
+
+    predictions = (
+        probabilities >= threshold
+    ).astype(int)
+
+
+    tn, fp, fn, tp = (
+        confusion_matrix(
+            y_true,
+            predictions,
+            labels=[0,1]
+        ).ravel()
+    )
+
+
+    specificity = (
+
+        tn / (tn + fp)
+
+        if (tn + fp) > 0
+
+        else 0
+
+    )
+
+
+    metrics = {
+
+        "ROC_AUC":
+            roc_auc_score(
+                y_true,
+                probabilities
+            ),
+
+        "PR_AUC":
+            average_precision_score(
+                y_true,
+                probabilities
+            ),
+
+        "Accuracy":
+            accuracy_score(
+                y_true,
+                predictions
+            ),
+
+        "Balanced_Accuracy":
+            balanced_accuracy_score(
+                y_true,
+                predictions
+            ),
+
+        "Precision":
+            precision_score(
+                y_true,
+                predictions,
+                zero_division=0
+            ),
+
+        "Recall":
+            recall_score(
+                y_true,
+                predictions,
+                zero_division=0
+            ),
+
+        "Specificity":
+            specificity,
+
+        "F1":
+            f1_score(
+                y_true,
+                predictions,
+                zero_division=0
+            ),
+
+        "MCC":
+            matthews_corrcoef(
+                y_true,
+                predictions
+            ),
+
+        "Log_Loss":
+            log_loss(
+                y_true,
+                probabilities
+            ),
+
+        "Brier_Score":
+            brier_score_loss(
+                y_true,
+                probabilities
+            ),
+
+        "TP":
+            tp,
+
+        "TN":
+            tn,
+
+        "FP":
+            fp,
+
+        "FN":
+            fn
+
+    }
+
+
+    return metrics
+
+
+# ================================================================
+# 44. MODEL 1 — LOGISTIC REGRESSION
+# ================================================================
+
+print("\n")
+print("=" * 80)
+print("LOGISTIC REGRESSION")
+print("=" * 80)
+
+
+logistic_model = LogisticRegression(
+
+    max_iter=3000,
+
+    class_weight="balanced",
+
+    random_state=RANDOM_STATE,
+
+    solver="liblinear"
+
+)
+
+
+logistic_model.fit(
+
+    X_train_processed,
+
+    y_train
+
+)
+
+
+logistic_prob = (
+
+    logistic_model
+    .predict_proba(
+        X_valid_processed
+    )[:,1]
+
+)
+
+
+logistic_metrics = calculate_metrics(
+
+    y_valid,
+
+    logistic_prob,
+
+    DEFAULT_THRESHOLD
+
+)
+
+
+logistic_metrics[
+    "Model"
+] = "Logistic Regression"
+
+
+print(
+    pd.Series(
+        logistic_metrics
+    )
+)
+
+
+# ================================================================
+# 45. LOGISTIC REGRESSION COEFFICIENTS
+# ================================================================
+
+logistic_coefficients = pd.DataFrame({
+
+    "feature":
+        feature_names,
+
+    "coefficient":
+        logistic_model.coef_[0]
+
+})
+
+
+logistic_coefficients[
+    "odds_ratio"
+] = np.exp(
+    logistic_coefficients[
+        "coefficient"
+    ]
+)
+
+
+logistic_coefficients[
+    "absolute_coefficient"
+] = (
+
+    logistic_coefficients[
+        "coefficient"
+    ].abs()
+
+)
+
+
+logistic_coefficients = (
+
+    logistic_coefficients
+
+    .sort_values(
+        "absolute_coefficient",
+        ascending=False
+    )
+
+)
+
+
+logistic_coefficients.to_csv(
+
+    os.path.join(
+        TABLE_DIR,
+        "logistic_coefficients.csv"
+    ),
+
+    index=False
+
+)
+
+
+print("\nTop Logistic Regression drivers:")
+
+print(
+    logistic_coefficients.head(20)
+)
+
+
+# ================================================================
+# 46. LOGISTIC COEFFICIENT PLOT
+# ================================================================
+
+top_positive = (
+
+    logistic_coefficients
+    .sort_values(
+        "coefficient",
+        ascending=False
+    )
+    .head(10)
+
+)
+
+
+top_negative = (
+
+    logistic_coefficients
+    .sort_values(
+        "coefficient",
+        ascending=True
+    )
+    .head(10)
+
+)
+
+
+coef_plot = pd.concat(
+    [
+        top_negative,
+        top_positive
+    ]
+)
+
+
+plt.figure(
+    figsize=(10,8)
+)
+
+
+sns.barplot(
+
+    data=coef_plot,
+
+    x="coefficient",
+
+    y="feature"
+
+)
+
+
+plt.axvline(
+    0,
+    linestyle="--"
+)
+
+
+plt.title(
+    "Logistic Regression - Key Drivers"
+)
+
+
+plt.xlabel(
+    "Coefficient / Log-Odds"
+)
+
+
+save_plot(
+    "13_logistic_coefficients.png"
+)
+
+
+# ================================================================
+# 47. MODEL 2 — RANDOM FOREST
+# ================================================================
+
+print("\n")
+print("=" * 80)
+print("RANDOM FOREST")
+print("=" * 80)
+
+
+random_forest = RandomForestClassifier(
+
+    n_estimators=700,
+
+    max_depth=None,
+
+    min_samples_leaf=3,
+
+    max_features="sqrt",
+
+    class_weight="balanced_subsample",
+
+    oob_score=True,
+
+    random_state=RANDOM_STATE,
+
+    n_jobs=N_JOBS
+
+)
+
+
+random_forest.fit(
+
+    X_train_processed,
+
+    y_train
+
+)
+
+
+rf_prob = (
+
+    random_forest
+    .predict_proba(
+        X_valid_processed
+    )[:,1]
+
+)
+
+
+rf_metrics = calculate_metrics(
+
+    y_valid,
+
+    rf_prob,
+
+    DEFAULT_THRESHOLD
+
+)
+
+
+rf_metrics[
+    "Model"
+] = "Random Forest"
+
+
+rf_metrics[
+    "OOB_Score"
+] = random_forest.oob_score_
+
+
+print(
+    pd.Series(
+        rf_metrics
+    )
+)
+
+
+# ================================================================
+# 48. RANDOM FOREST FEATURE IMPORTANCE
+# ================================================================
+
+rf_importance = pd.DataFrame({
+
+    "feature":
+        feature_names,
+
+    "importance":
+        random_forest.feature_importances_
+
+})
+
+
+rf_importance = (
+
+    rf_importance
+    .sort_values(
+        "importance",
+        ascending=False
+    )
+
+)
+
+
+rf_importance.to_csv(
+
+    os.path.join(
+        TABLE_DIR,
+        "random_forest_importance.csv"
+    ),
+
+    index=False
+
+)
+
+
+print(
+    rf_importance.head(20)
+)
+
+
+plt.figure(
+    figsize=(10,8)
+)
+
+
+sns.barplot(
+
+    data=rf_importance.head(20),
+
+    x="importance",
+
+    y="feature"
+
+)
+
+
+plt.title(
+    "Random Forest - Top 20 Features"
+)
+
+
+plt.xlabel(
+    "Feature Importance"
+)
+
+
+save_plot(
+    "14_random_forest_importance.png"
+)
+
+
+# ================================================================
+# 49. RANDOM FOREST PERMUTATION IMPORTANCE
+# ================================================================
+
+permutation = permutation_importance(
+
+    random_forest,
+
+    X_valid_processed,
+
+    y_valid,
+
+    scoring="roc_auc",
+
+    n_repeats=10,
+
+    random_state=RANDOM_STATE,
+
+    n_jobs=N_JOBS
+
+)
+
+
+permutation_importance_df = pd.DataFrame({
+
+    "feature":
+        feature_names,
+
+    "mean_importance":
+        permutation.importances_mean,
+
+    "std_importance":
+        permutation.importances_std
+
+})
+
+
+permutation_importance_df = (
+
+    permutation_importance_df
+
+    .sort_values(
+        "mean_importance",
+        ascending=False
+    )
+
+)
+
+
+permutation_importance_df.to_csv(
+
+    os.path.join(
+        TABLE_DIR,
+        "random_forest_permutation_importance.csv"
+    ),
+
+    index=False
+
+)
+
+
+plt.figure(
+    figsize=(10,8)
+)
+
+
+sns.barplot(
+
+    data=permutation_importance_df.head(20),
+
+    x="mean_importance",
+
+    y="feature"
+
+)
+
+
+plt.title(
+    "Random Forest - Validation Permutation Importance"
+)
+
+
+plt.xlabel(
+    "Mean Decrease in ROC-AUC"
+)
+
+
+save_plot(
+    "15_random_forest_permutation_importance.png"
+)
+
+
+# ================================================================
+# 50. MODEL 3 — XGBOOST / GRADIENT BOOSTING
+# ================================================================
+
+print("\n")
+print("=" * 80)
+print("GRADIENT BOOSTING / XGBOOST")
+print("=" * 80)
+
+
+cv = StratifiedKFold(
+
+    n_splits=5,
+
+    shuffle=True,
+
+    random_state=RANDOM_STATE
+
+)
+
+
+if XGB_AVAILABLE:
+
+    boosting_model = XGBClassifier(
+
+        objective="binary:logistic",
+
+        eval_metric="logloss",
+
+        tree_method="hist",
+
+        random_state=RANDOM_STATE,
+
+        n_jobs=N_JOBS,
+
+        subsample=0.85,
+
+        colsample_bytree=0.85
+
+    )
+
+
+    parameter_grid = {
+
+        "n_estimators": [
+            200,
+            400
+        ],
+
+        "max_depth": [
+            2,
+            3,
+            5
+        ],
+
+        "learning_rate": [
+            0.03,
+            0.08,
+            0.15
+        ]
+
+    }
+
+
+    boosting_name = "XGBoost"
+
+
+else:
+
+    boosting_model = GradientBoostingClassifier(
+
+        random_state=RANDOM_STATE
+
+    )
+
+
+    parameter_grid = {
+
+        "n_estimators": [
+            100,
+            200
+        ],
+
+        "max_depth": [
+            2,
+            3,
+            5
+        ],
+
+        "learning_rate": [
+            0.03,
+            0.08,
+            0.15
+        ]
+
+    }
+
+
+    boosting_name = "Gradient Boosting"
+
+
+grid_search = GridSearchCV(
+
+    estimator=boosting_model,
+
+    param_grid=parameter_grid,
+
+    scoring="roc_auc",
+
+    cv=cv,
+
+    n_jobs=N_JOBS,
+
+    refit=True,
+
+    return_train_score=True,
+
+    verbose=1
+
+)
+
+
+grid_search.fit(
+
+    X_train_processed,
+
+    y_train
+
+)
+
+
+best_boosting = (
+    grid_search.best_estimator_
+)
+
+
+print(
+    "\nBest parameters:"
+)
+
+print(
+    grid_search.best_params_
+)
+
+
+print(
+    "\nBest 5-fold CV ROC-AUC:"
+)
+
+print(
+    grid_search.best_score_
+)
+
+
+boosting_prob = (
+
+    best_boosting
+    .predict_proba(
+        X_valid_processed
+    )[:,1]
+
+)
+
+
+boosting_metrics = calculate_metrics(
+
+    y_valid,
+
+    boosting_prob,
+
+    DEFAULT_THRESHOLD
+
+)
+
+
+boosting_metrics[
+    "Model"
+] = boosting_name
+
+
+print(
+    pd.Series(
+        boosting_metrics
+    )
+)
+
+
+# ================================================================
+# 51. SAVE GRID SEARCH RESULTS
+# ================================================================
+
+grid_results = (
+
+    pd.DataFrame(
+        grid_search.cv_results_
+    )
+
+    .sort_values(
+        "rank_test_score"
+    )
+
+)
+
+
+grid_results.to_csv(
+
+    os.path.join(
+        TABLE_DIR,
+        "boosting_grid_search_results.csv"
+    ),
+
+    index=False
+
+)
+
+
+# ================================================================
+# 52. BOOSTING FEATURE IMPORTANCE
+# ================================================================
+
+boosting_importance = pd.DataFrame({
+
+    "feature":
+        feature_names,
+
+    "importance":
+        best_boosting.feature_importances_
+
+})
+
+
+boosting_importance = (
+
+    boosting_importance
+
+    .sort_values(
+        "importance",
+        ascending=False
+    )
+
+)
+
+
+boosting_importance.to_csv(
+
+    os.path.join(
+        TABLE_DIR,
+        "boosting_feature_importance.csv"
+    ),
+
+    index=False
+
+)
+
+
+print(
+    boosting_importance.head(20)
+)
+
+
+plt.figure(
+    figsize=(10,8)
+)
+
+
+sns.barplot(
+
+    data=boosting_importance.head(20),
+
+    x="importance",
+
+    y="feature"
+
+)
+
+
+plt.title(
+    f"{boosting_name} - Top 20 Features"
+)
+
+
+plt.xlabel(
+    "Feature Importance"
+)
+
+
+save_plot(
+    "16_boosting_importance.png"
+)
+
+
+# ================================================================
+# 53. MODEL COMPARISON TABLE
+# ================================================================
+
+model_results = pd.DataFrame([
+
+    logistic_metrics,
+
+    rf_metrics,
+
+    boosting_metrics
+
+])
+
+
+model_results = model_results[
+    [
+        "Model",
+
+        "ROC_AUC",
+
+        "PR_AUC",
+
+        "Accuracy",
+
+        "Balanced_Accuracy",
+
+        "Precision",
+
+        "Recall",
+
+        "Specificity",
+
+        "F1",
+
+        "MCC",
+
+        "Log_Loss",
+
+        "Brier_Score",
+
+        "TP",
+
+        "TN",
+
+        "FP",
+
+        "FN"
+
+    ]
+
+]
+
+
+model_results = (
+
+    model_results
+
+    .sort_values(
+        "ROC_AUC",
+        ascending=False
+    )
+
+)
+
+
+print("\n")
+print("=" * 80)
+print("MODEL PERFORMANCE COMPARISON")
+print("=" * 80)
+
+print(
+    model_results
+)
+
+
+model_results.to_csv(
+
+    os.path.join(
+        TABLE_DIR,
+        "model_comparison.csv"
+    ),
+
+    index=False
+
+)
+
+
+# ================================================================
+# 54. MODEL COMPARISON PLOTS
+# ================================================================
+
+comparison_metrics = [
+
+    "ROC_AUC",
+
+    "PR_AUC",
+
+    "Accuracy",
+
+    "Balanced_Accuracy",
+
+    "Precision",
+
+    "Recall",
+
+    "Specificity",
+
+    "F1",
+
+    "MCC",
+
+    "Log_Loss",
+
+    "Brier_Score"
+
+]
+
+
+for metric in comparison_metrics:
+
+    plt.figure(
+        figsize=(10,5)
+    )
+
+
+    sns.barplot(
+
+        data=model_results,
+
+        x=metric,
+
+        y="Model"
+
+    )
+
+
+    plt.title(
+        f"Model Comparison - {metric}"
+    )
+
+
+    plt.xlabel(
+        metric
+    )
+
+
+    plt.ylabel(
+        ""
+    )
+
+
+    save_plot(
+        f"17_model_comparison_{metric}.png"
+    )
+
+
+# ================================================================
+# 55. ROC-AUC CURVES
+# ================================================================
+
+model_probabilities = {
+
+    "Logistic Regression":
+        logistic_prob,
+
+    "Random Forest":
+        rf_prob,
+
+    boosting_name:
+        boosting_prob
+
+}
+
+
+plt.figure(
+    figsize=(9,7)
+)
+
+
+for name, probability in (
+    model_probabilities.items()
+):
+
+    fpr, tpr, thresholds = (
+        roc_curve(
+            y_valid,
+            probability
+        )
+    )
+
+
+    auc_value = (
+        roc_auc_score(
+            y_valid,
+            probability
+        )
+    )
+
+
+    plt.plot(
+
+        fpr,
+
+        tpr,
+
+        label=f"{name} (AUC={auc_value:.4f})"
+
+    )
+
+
+plt.plot(
+
+    [0,1],
+
+    [0,1],
+
+    linestyle="--"
+
+)
+
+
+plt.xlabel(
+    "False Positive Rate"
+)
+
+
+plt.ylabel(
+    "True Positive Rate"
+)
+
+
+plt.title(
+    "Validation ROC-AUC Curves"
+)
+
+
+plt.legend()
+
+
+save_plot(
+    "18_ROC_AUC_curves.png"
+)
+
+
+# ================================================================
+# 56. PRECISION-RECALL CURVES
+# ================================================================
+
+plt.figure(
+    figsize=(9,7)
+)
+
+
+for name, probability in (
+    model_probabilities.items()
+):
+
+    precision, recall, thresholds = (
+        precision_recall_curve(
+            y_valid,
+            probability
+        )
+    )
+
+
+    pr_auc = (
+        average_precision_score(
+            y_valid,
+            probability
+        )
+    )
+
+
+    plt.plot(
+
+        recall,
+
+        precision,
+
+        label=f"{name} (PR-AUC={pr_auc:.4f})"
+
+    )
+
+
+baseline = y_valid.mean()
+
+
+plt.axhline(
+
+    baseline,
+
+    linestyle="--",
+
+    label=f"Baseline={baseline:.4f}"
+
+)
+
+
+plt.xlabel(
+    "Recall"
+)
+
+
+plt.ylabel(
+    "Precision"
+)
+
+
+plt.title(
+    "Validation Precision-Recall Curves"
+)
+
+
+plt.legend()
+
+
+save_plot(
+    "19_precision_recall_curves.png"
+)
+
+
+# ================================================================
+# 57. CONFUSION MATRICES
+# ================================================================
+
+for name, probability in (
+    model_probabilities.items()
+):
+
+    prediction = (
+
+        probability
+        >=
+        DEFAULT_THRESHOLD
+
+    ).astype(int)
+
+
+    cm = confusion_matrix(
+
+        y_valid,
+
+        prediction,
+
+        labels=[0,1]
+
+    )
+
+
+    plt.figure(
+        figsize=(6,5)
+    )
+
+
+    sns.heatmap(
+
+        cm,
+
+        annot=True,
+
+        fmt="d",
+
+        cmap="Blues",
+
+        cbar=False
+
+    )
+
+
+    plt.title(
+
+        f"{name} - Confusion Matrix"
+
+    )
+
+
+    plt.xlabel(
+        "Predicted"
+    )
+
+
+    plt.ylabel(
+        "Actual"
+    )
+
+
+    filename = (
+        name
+        .replace(" ", "_")
+        .replace("/", "_")
+    )
+
+
+    save_plot(
+        f"20_confusion_matrix_{filename}.png"
+    )
+
+
+# ================================================================
+# 58. THRESHOLD ANALYSIS
+# ================================================================
+
+threshold_values = np.arange(
+    0.10,
+    0.91,
+    0.02
+)
+
+
+threshold_results = []
+
+
+for name, probability in (
+    model_probabilities.items()
+):
+
+    for threshold in threshold_values:
+
+        metrics = calculate_metrics(
+
+            y_valid,
+
+            probability,
+
+            threshold
+
+        )
+
+
+        metrics[
+            "Model"
+        ] = name
+
+
+        threshold_results.append(
+            metrics
+        )
+
+
+threshold_df = pd.DataFrame(
+    threshold_results
+)
+
+
+threshold_df.to_csv(
+
+    os.path.join(
+        TABLE_DIR,
+        "threshold_analysis.csv"
+    ),
+
+    index=False
+
+)
+
+
+# ================================================================
+# 59. OPTIMAL F1 THRESHOLD
+# ================================================================
+
+best_thresholds = (
+
+    threshold_df
+
+    .sort_values(
+        [
+            "Model",
+            "F1"
+        ],
+
+        ascending=[
+            True,
+            False
+        ]
+    )
+
+    .groupby(
+        "Model"
+    )
+
+    .first()
+
+    .reset_index()
+
+)
+
+
+print("\nBest F1 thresholds:")
+
+print(
+    best_thresholds[
+        [
+            "Model",
+            "threshold",
+            "F1",
+            "Precision",
+            "Recall",
+            "Specificity"
+        ]
+    ]
+)
+
+
+best_thresholds.to_csv(
+
+    os.path.join(
+        TABLE_DIR,
+        "best_F1_thresholds.csv"
+    ),
+
+    index=False
+
+)
+
+
+# ================================================================
+# 60. F1 VS THRESHOLD
+# ================================================================
+
+plt.figure(
+    figsize=(9,6)
+)
+
+
+for name in model_probabilities:
+
+    temp = threshold_df[
+        threshold_df[
+            "Model"
+        ] == name
+    ]
+
+
+    plt.plot(
+
+        temp["threshold"],
+
+        temp["F1"],
+
+        marker="o",
+
+        label=name
+
+    )
+
+
+plt.xlabel(
+    "Probability Threshold"
+)
+
+
+plt.ylabel(
+    "F1 Score"
+)
+
+
+plt.title(
+    "F1 Score vs Probability Threshold"
+)
+
+
+plt.legend()
+
+
+save_plot(
+    "21_F1_threshold_analysis.png"
+)
+
+
+# ================================================================
+# 61. BUSINESS COST THRESHOLD ANALYSIS
+# ================================================================
+#
+# Example:
+#
+# Missing a likely adopter = cost 5
+# Wasting outreach on non-adopter = cost 1
+#
+# Change these values according to business preference.
+# ================================================================
+
+FN_COST = 5
+
+FP_COST = 1
+
+
+business_rows = []
+
+
+for name, probability in (
+    model_probabilities.items()
+):
+
+    for threshold in threshold_values:
+
+        prediction = (
+
+            probability
+            >=
+            threshold
+
+        ).astype(int)
+
+
+        tn, fp, fn, tp = (
+            confusion_matrix(
+                y_valid,
+                prediction,
+                labels=[0,1]
+            ).ravel()
+        )
+
+
+        total_cost = (
+
+            FN_COST * fn
+            +
+            FP_COST * fp
+
+        )
+
+
+        business_rows.append({
+
+            "Model": name,
+
+            "threshold": threshold,
+
+            "business_cost":
+                total_cost,
+
+            "TP": tp,
+
+            "TN": tn,
+
+            "FP": fp,
+
+            "FN": fn
+
+        })
+
+
+business_cost_df = pd.DataFrame(
+    business_rows
+)
+
+
+business_cost_df.to_csv(
+
+    os.path.join(
+        TABLE_DIR,
+        "business_threshold_analysis.csv"
+    ),
+
+    index=False
+
+)
+
+
+best_business_threshold = (
+
+    business_cost_df
+
+    .sort_values(
+        [
+            "Model",
+            "business_cost"
+        ]
+    )
+
+    .groupby(
+        "Model"
+    )
+
+    .first()
+
+    .reset_index()
+
+)
+
+
+print(
+    "\nBest business-cost thresholds:"
+)
+
+
+print(
+    best_business_threshold
+)
+
+
+# ================================================================
+# 62. CALIBRATION CURVES
+# ================================================================
+
+plt.figure(
+    figsize=(9,7)
+)
+
+
+for name, probability in (
+    model_probabilities.items()
+):
+
+    fraction_positive, mean_predicted = (
+        calibration_curve(
+
+            y_valid,
+
+            probability,
+
+            n_bins=10,
+
+            strategy="quantile"
+
+        )
+    )
+
+
+    plt.plot(
+
+        mean_predicted,
+
+        fraction_positive,
+
+        marker="o",
+
+        label=name
+
+    )
+
+
+plt.plot(
+
+    [0,1],
+
+    [0,1],
+
+    linestyle="--"
+
+)
+
+
+plt.xlabel(
+    "Mean Predicted Probability"
+)
+
+
+plt.ylabel(
+    "Observed Adoption Rate"
+)
+
+
+plt.title(
+    "Validation Calibration Curves"
+)
+
+
+plt.legend()
+
+
+save_plot(
+    "22_calibration_curves.png"
+)
+
+
+# ================================================================
+# 63. DECILE / LIFT ANALYSIS
+# ================================================================
+
+def decile_lift(
+    y_true,
+    probabilities
+):
+
+    temp = pd.DataFrame({
+
+        "actual":
+            np.asarray(y_true),
+
+        "probability":
+            np.asarray(probabilities)
+
+    })
+
+
+    temp["decile"] = pd.qcut(
+
+        temp["probability"],
+
+        10,
+
+        labels=False,
+
+        duplicates="drop"
+
+    )
+
+
+    # Highest probability = decile 1
+    temp["decile"] = (
+        10
+        -
+        temp["decile"]
+    )
+
+
+    overall_rate = (
+        temp["actual"].mean()
+    )
+
+
+    result = (
+
+        temp
+        .groupby("decile")
+
+        .agg(
+
+            n=(
+                "actual",
+                "size"
+            ),
+
+            adopters=(
+                "actual",
+                "sum"
+            ),
+
+            mean_probability=(
+                "probability",
+                "mean"
+            ),
+
+            adoption_rate=(
+                "actual",
+                "mean"
+            )
+
+        )
+
+        .reset_index()
+
+        .sort_values(
+            "decile"
+        )
+
+    )
+
+
+    result[
+        "adoption_rate_pct"
+    ] = (
+
+        result[
+            "adoption_rate"
+        ]
+
+        * 100
+
+    )
+
+
+    result[
+        "lift"
+    ] = (
+
+        result[
+            "adoption_rate"
+        ]
+
+        /
+        overall_rate
+
+    )
+
+
+    result[
+        "cumulative_adopters"
+    ] = (
+        result[
+            "adopters"
+        ].cumsum()
+    )
+
+
+    result[
+        "cumulative_capture_rate"
+    ] = (
+
+        result[
+            "cumulative_adopters"
+        ]
+
+        /
+        temp[
+            "actual"
+        ].sum()
+
+    )
+
+
+    return result
+
+
+# ================================================================
+# 64. LIFT FOR ALL MODELS
+# ================================================================
+
+for name, probability in (
+    model_probabilities.items()
+):
+
+    lift_table = decile_lift(
+
+        y_valid,
+
+        probability
+
+    )
+
+
+    filename = (
+
+        name
+        .replace(" ", "_")
+        .replace("/", "_")
+
+    )
+
+
+    lift_table.to_csv(
+
+        os.path.join(
+            TABLE_DIR,
+            f"lift_{filename}.csv"
+        ),
+
+        index=False
+
+    )
+
+
+# ================================================================
+# 65. LIFT PLOT FOR BEST ROC-AUC MODEL
+# ================================================================
+
+best_model_row = (
+
+    model_results
+
+    .sort_values(
+        "ROC_AUC",
+        ascending=False
+    )
+
+    .iloc[0]
+
+)
+
+
+best_model_name = (
+    best_model_row["Model"]
+)
+
+
+best_probability = (
+    model_probabilities[
+        best_model_name
+    ]
+)
+
+
+best_lift = decile_lift(
+
+    y_valid,
+
+    best_probability
+
+)
+
+
+plt.figure(
+    figsize=(9,6)
+)
+
+
+sns.barplot(
+
+    data=best_lift,
+
+    x="decile",
+
+    y="lift"
+
+)
+
+
+plt.axhline(
+
+    1,
+
+    linestyle="--"
+
+)
+
+
+plt.title(
+
+    f"Validation Decile Lift - {best_model_name}"
+
+)
+
+
+plt.xlabel(
+
+    "Probability Decile - 1 = Highest"
+
+)
+
+
+plt.ylabel(
+    "Lift"
+)
+
+
+save_plot(
+    "23_decile_lift.png"
+)
+
+
+# ================================================================
+# 66. TOP-200 VALIDATION CAPTURE ANALYSIS
+# ================================================================
+
+validation_ranked = pd.DataFrame({
+
+    "actual":
+        y_valid.values,
+
+    "probability":
+        best_probability
+
+})
+
+
+validation_ranked = (
+    validation_ranked
+    .sort_values(
+        "probability",
+        ascending=False
+    )
+)
+
+
+top200_validation = (
+    validation_ranked
+    .head(
+        min(
+            200,
+            len(validation_ranked)
+        )
+    )
+)
+
+
+top200_capture = (
+    top200_validation[
+        "actual"
+    ].sum()
+    /
+    validation_ranked[
+        "actual"
+    ].sum()
+)
+
+
+print(
+    "\nTop-200 validation capture rate:",
+    top200_capture
+)
+
+
+# ================================================================
+# 67. FEATURE IMPORTANCE COMPARISON
+# ================================================================
+
+lr_compare = logistic_coefficients[
+    [
+        "feature",
+        "coefficient",
+        "odds_ratio"
+    ]
+].copy()
+
+
+lr_compare[
+    "logistic_rank"
+] = range(
+    1,
+    len(lr_compare) + 1
+)
+
+
+rf_compare = rf_importance[
+    [
+        "feature",
+        "importance"
+    ]
+].copy()
+
+
+rf_compare[
+    "rf_rank"
+] = range(
+    1,
+    len(rf_compare) + 1
+)
+
+
+gb_compare = boosting_importance[
+    [
+        "feature",
+        "importance"
+    ]
+].copy()
+
+
+gb_compare.columns = [
+    "feature",
+    "boosting_importance"
+]
+
+
+gb_compare[
+    "boosting_rank"
+] = range(
+    1,
+    len(gb_compare) + 1
+)
+
+
+feature_comparison = (
+
+    lr_compare
+
+    .merge(
+        rf_compare,
+        on="feature",
+        how="outer"
+    )
+
+    .merge(
+        gb_compare,
+        on="feature",
+        how="outer"
+    )
+
+)
+
+
+feature_comparison.to_csv(
+
+    os.path.join(
+        TABLE_DIR,
+        "feature_importance_comparison.csv"
+    ),
+
+    index=False
+
+)
+
+
+print(
+    "\nTop features by Logistic Regression:"
+)
+
+print(
+    lr_compare.head(10)
+)
+
+
+print(
+    "\nTop features by Random Forest:"
+)
+
+print(
+    rf_compare.head(10)
+)
+
+
+print(
+    f"\nTop features by {boosting_name}:"
+)
+
+print(
+    gb_compare.head(10)
+)
+
+
+# ================================================================
+# 68. MODEL SELECTION
+# ================================================================
+#
+# Primary criterion:
+# ROC-AUC
+#
+# Tie-breakers:
+# PR-AUC
+# F1
+# ================================================================
+
+model_results_sorted = (
+
+    model_results
+
+    .sort_values(
+
+        [
+            "ROC_AUC",
+            "PR_AUC",
+            "F1"
+
+        ],
+
+        ascending=False
+
+    )
+
+)
+
+
+selected_model_name = (
+    model_results_sorted.iloc[0]["Model"]
+)
+
+
+print("\n")
+print("=" * 80)
+print("FINAL MODEL SELECTION")
+print("=" * 80)
+
+
+print(
+    "Selected model:",
+    selected_model_name
+)
+
+
+# ================================================================
+# 69. PREPARE COMPLETE LABELLED DATA
+# ================================================================
+
+all_labelled = physician_features[
+    physician_features[
+        "is_test"
+    ] == 0
+].copy()
+
+
+test_physicians_final = physician_features[
+    physician_features[
+        "is_test"
+    ] == 1
+].copy()
+
+
+# ================================================================
+# 70. RECOMPUTE TERRITORY TARGET ENCODING USING ALL LABELLED DATA
+# ================================================================
+
+final_global_rate = (
+    all_labelled[
+        "adopted"
+    ].mean()
+)
+
+
+final_territory_stats = (
+
+    all_labelled
+    .groupby(
+        "territory_code"
+    )["adopted"]
+
+    .agg(
+        [
+            "sum",
+            "count"
+        ]
+    )
+
+)
+
+
+final_territory_stats[
+    "rate"
+] = (
+
+    final_territory_stats[
+        "sum"
+    ]
+
+    +
+    SMOOTHING_ALPHA
+    *
+    final_global_rate
+
+) / (
+
+    final_territory_stats[
+        "count"
+    ]
+
+    +
+    SMOOTHING_ALPHA
+
+)
+
+
+final_territory_map = (
+    final_territory_stats[
+        "rate"
+    ].to_dict()
+)
+
+
+all_labelled[
+    "territory_adoption_rate"
+] = (
+
+    all_labelled[
+        "territory_code"
+    ]
+
+    .map(
+        final_territory_map
+    )
+
+    .fillna(
+        final_global_rate
+    )
+
+)
+
+
+test_physicians_final[
+    "territory_adoption_rate"
+] = (
+
+    test_physicians_final[
+        "territory_code"
+    ]
+
+    .map(
+        final_territory_map
+    )
+
+    .fillna(
+        final_global_rate
+    )
+
+)
+
+
+# ================================================================
+# 71. FINAL X/Y
+# ================================================================
+
+X_all = all_labelled[
+    final_numeric_features
+    +
+    final_categorical_features
+].copy()
+
+
+y_all = all_labelled[
+    "adopted"
+].astype(int)
+
+
+X_test = test_physicians_final[
+    final_numeric_features
+    +
+    final_categorical_features
+].copy()
+
+
+# ================================================================
+# 72. FINAL PREPROCESSOR
+# ================================================================
+
+final_preprocessor = clone(
+    preprocessor
+)
+
+
+X_all_processed = (
+    final_preprocessor
+    .fit_transform(
+        X_all
+    )
+)
+
+
+X_test_processed = (
+    final_preprocessor
+    .transform(
+        X_test
+    )
+)
+
+
+# ================================================================
+# 73. CREATE FINAL MODEL
+# ================================================================
+
+if selected_model_name == "Logistic Regression":
+
+    final_model = LogisticRegression(
+
+        max_iter=3000,
+
+        class_weight="balanced",
+
+        random_state=RANDOM_STATE,
+
+        solver="liblinear"
+
+    )
+
+
+elif selected_model_name == "Random Forest":
+
+    final_model = RandomForestClassifier(
+
+        n_estimators=700,
+
+        max_depth=None,
+
+        min_samples_leaf=3,
+
+        max_features="sqrt",
+
+        class_weight="balanced_subsample",
+
+        random_state=RANDOM_STATE,
+
+        n_jobs=N_JOBS
+
+    )
+
+
+else:
+
+    final_model = clone(
+        best_boosting
+    )
+
+
+# ================================================================
+# 74. FIT FINAL MODEL
+# ================================================================
+
+print("\nFitting final model...")
+
+final_model.fit(
+
+    X_all_processed,
+
+    y_all
+
+)
+
+
+# ================================================================
+# 75. TEST PREDICTIONS
+# ================================================================
+
+test_probability = (
+
+    final_model
+    .predict_proba(
+        X_test_processed
+    )[:,1]
+
+)
+
+
+test_prediction = (
+
+    test_probability
+    >=
+    DEFAULT_THRESHOLD
+
+).astype(int)
+
+
+# ================================================================
+# 76. CREATE PREDICTION DATAFRAME
+# ================================================================
+
+predictions = pd.DataFrame({
+
+    "physician_id":
+        test_physicians_final[
+            "physician_id"
+        ].values,
+
+    "adoption_probability":
+        test_probability,
+
+    "adoption_prediction":
+        test_prediction
+
+})
+
+
+# ================================================================
+# 77. ADD ENGINEERED FEATURES
+# ================================================================
+
+for col in (
+
+    final_numeric_features
+    +
+    final_categorical_features
+
+):
+
+    predictions[col] = (
+        test_physicians_final[
+            col
+        ].values
+    )
+
+
+# ================================================================
+# 78. RANK PHYSICIANS
+# ================================================================
+
+predictions = (
+
+    predictions
+
+    .sort_values(
+
+        "adoption_probability",
+
+        ascending=False
+
+    )
+
+    .reset_index(
+        drop=True
+    )
+
+)
+
+
+predictions[
+    "rank"
+] = (
+
+    np.arange(
+        len(predictions)
+    )
+    +
+    1
+
+)
+
+
+predictions[
+    "top_200_target"
+] = (
+
+    predictions[
+        "rank"
+    ]
+
+    <= TOP_N
+
+).astype(int)
+
+
+# ================================================================
+# 79. SAVE predictions.csv
+# ================================================================
+
+prediction_file = os.path.join(
+
+    OUTPUT_DIR,
+
+    "predictions.csv"
+
+)
+
+
+predictions.to_csv(
+
+    prediction_file,
+
+    index=False
+
+)
+
+
+# ================================================================
+# 80. SAVE TOP 200
+# ================================================================
+
+top200 = predictions.head(
+    TOP_N
+)
+
+
+top200_file = os.path.join(
+
+    OUTPUT_DIR,
+
+    "top_200_targets.csv"
+
+)
+
+
+top200.to_csv(
+
+    top200_file,
+
+    index=False
+
+)
+
+
+# ================================================================
+# 81. TEST PROBABILITY DISTRIBUTION
+# ================================================================
+
+plt.figure(
+    figsize=(9,6)
+)
+
+
+sns.histplot(
+
+    predictions[
+        "adoption_probability"
+    ],
+
+    bins=30,
+
+    kde=True
+
+)
+
+
+plt.axvline(
+
+    DEFAULT_THRESHOLD,
+
+    linestyle="--",
+
+    label="Threshold = 0.50"
+
+)
+
+
+plt.title(
+    "Predicted Q11 Adoption Probability"
+)
+
+
+plt.xlabel(
+    "Adoption Probability"
+)
+
+
+plt.ylabel(
+    "Number of Physicians"
+)
+
+
+plt.legend()
+
+
+save_plot(
+    "24_test_probability_distribution.png"
+)
+
+
+# ================================================================
+# 82. TOP 200 PROBABILITY ANALYSIS
+# ================================================================
+
+print("\n")
+print("=" * 80)
+print("TOP 200 PHYSICIANS")
+print("=" * 80)
+
+
+print(
+
+    predictions[
+        [
+            "rank",
+
+            "physician_id",
+
+            "adoption_probability",
+
+            "adoption_prediction"
+
+        ]
+
+    ].head(200).to_string(
+        index=False
+    )
+
+)
+
+
+# ================================================================
+# 83. FINAL SUMMARY
+# ================================================================
+
+summary = {
+
+    "selected_model":
+        selected_model_name,
+
+    "validation_ROC_AUC":
+        float(
+            model_results_sorted.iloc[0][
+                "ROC_AUC"
+            ]
+        ),
+
+    "validation_PR_AUC":
+        float(
+            model_results_sorted.iloc[0][
+                "PR_AUC"
+            ]
+        ),
+
+    "validation_F1":
+        float(
+            model_results_sorted.iloc[0][
+                "F1"
+            ]
+        ),
+
+    "number_of_test_physicians":
+        int(
+            len(predictions)
+        ),
+
+    "top_200_mean_probability":
+        float(
+            top200[
+                "adoption_probability"
+            ].mean()
+        ),
+
+    "top_200_median_probability":
+        float(
+            top200[
+                "adoption_probability"
+            ].median()
+        ),
+
+    "predicted_adopters_threshold_0_5":
+        int(
+            predictions[
+                "adoption_prediction"
+            ].sum()
+        )
+
+}
+
+
+with open(
+
+    os.path.join(
+        OUTPUT_DIR,
+        "run_summary.json"
+    ),
+
+    "w"
+
+) as f:
+
+    json.dump(
+
+        summary,
+
+        f,
+
+        indent=4
+
+    )
+
+
+# ================================================================
+# 84. SAVE FINAL FEATURE LIST
+# ================================================================
+
+with open(
+
+    os.path.join(
+        TABLE_DIR,
+        "final_feature_list.txt"
+    ),
+
+    "w"
+
+) as f:
+
+    f.write(
+        "NUMERIC FEATURES\n\n"
+    )
+
+    for feature in (
+        final_numeric_features
+    ):
+
+        f.write(
+            feature + "\n"
+        )
+
+
+    f.write(
+        "\n\nCATEGORICAL FEATURES\n\n"
+    )
+
+
+    for feature in (
+        final_categorical_features
+    ):
+
+        f.write(
+            feature + "\n"
+        )
+
+
+# ================================================================
+# 85. FINAL OUTPUT SUMMARY
+# ================================================================
+
+print("\n")
+print("=" * 80)
+print("PIPELINE COMPLETE")
+print("=" * 80)
+
+
+print(
+    "\nSelected final model:",
+    selected_model_name
+)
+
+
+print(
+    "\nValidation model comparison:"
+)
+
+
+print(
+    model_results.to_string(
+        index=False
+    )
+)
+
+
+print(
+    "\nNumber of test physicians:",
+    len(predictions)
+)
+
+
+print(
+    "\nPredicted adopters at 0.50 threshold:",
+    predictions[
+        "adoption_prediction"
+    ].sum()
+)
+
+
+print(
+    "\nTop 200 average predicted probability:",
+    top200[
+        "adoption_probability"
+    ].mean()
+)
+
+
+print(
+    "\nPrediction file saved at:"
+)
+
+
+print(
+    prediction_file
+)
+
+
+print(
+    "\nTop-200 file saved at:"
+)
+
+
+print(
+    top200_file
+)
+
+
+print(
+    "\nAll figures saved at:"
+)
+
+
+print(
+    FIGURE_DIR
+)
+
+
+print(
+    "\nAll tables saved at:"
+)
+
+
+print(
+    TABLE_DIR
+)
+
+
+print("\nDONE.")
