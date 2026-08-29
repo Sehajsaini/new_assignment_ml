@@ -1,0 +1,471 @@
+# ==============================================================================
+# ABC PHARMACEUTICALS - DRUG XYZ ADOPTION PREDICTION PIPELINE
+# ==============================================================================
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+from sklearn.model_selection import train_test_split, StratifiedKFold, cross_val_score
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.cluster import KMeans
+from sklearn.metrics import (
+    accuracy_score, roc_auc_score, f1_score, precision_score, recall_score, 
+    average_precision_score, classification_report, roc_curve, precision_recall_curve
+)
+from statsmodels.stats.outliers_influence import variance_inflation_factor
+import statsmodels.api as sm
+import statsmodels.formula.api as smf
+import xgboost as xgb
+import optuna
+import warnings
+
+warnings.filterwarnings('ignore')
+optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+# Global random state for exact reproducibility
+RANDOM_STATE = 42
+np.random.seed(RANDOM_STATE)
+plt.style.use('seaborn-v0_8-whitegrid' if 'seaborn-v0_8-whitegrid' in plt.style.available else 'default')
+
+# ------------------------------------------------------------------------------
+# STEP 1: COMPREHENSIVE EDA & MISSING VALUE AUDIT
+# ------------------------------------------------------------------------------
+print("==================================================================")
+print("--- STEP 1: COMPREHENSIVE EDA & MISSING VALUE AUDIT ---")
+print("==================================================================")
+
+# Load CSV / Excel Datasets
+df_long = pd.read_csv('input_data_file1.csv') if 'input_data_file1.csv' in pd.os.listdir() else pd.read_excel('input_data_file1.xlsx')
+df_static = pd.read_csv('input_data_file2.csv') if 'input_data_file2.csv' in pd.os.listdir() else pd.read_excel('input_data_file2.xlsx')
+test_physicians = pd.read_csv('test_physicians.csv') if 'test_physicians.csv' in pd.os.listdir() else pd.read_excel('test_physicians.xlsx')
+
+# Clean Quarter column to integer
+df_long['q_num'] = df_long['quarter'].astype(str).str.replace('Q', '').astype(int)
+
+# Missing Value Analysis
+print("\n--- Missing Value Audit (Longitudinal Dataset) ---")
+missing_long = df_long.isnull().sum()
+missing_long_pct = (missing_long / len(df_long)) * 100
+print(pd.DataFrame({'Missing Count': missing_long, 'Missing Pct (%)': missing_long_pct}))
+
+print("\n--- Missing Value Audit (Static Dataset) ---")
+missing_static = df_static.isnull().sum()
+missing_static_pct = (missing_static / len(df_static)) * 100
+print(pd.DataFrame({'Missing Count': missing_static, 'Missing Pct (%)': missing_static_pct}))
+
+# Target Definition (1 if rx_count > 0 in ANY Q1-Q10, else 0)
+physician_rx_totals = df_long.groupby('physician_id')['rx_count'].sum().reset_index()
+physician_rx_totals['adopted'] = (physician_rx_totals['rx_count'] > 0).astype(int)
+target_df = physician_rx_totals[['physician_id', 'adopted']]
+
+test_ids = set(test_physicians['physician_id'].unique())
+df_full_static = pd.merge(df_static, target_df, on='physician_id', how='left')
+
+df_train_pool_raw = df_full_static[~df_full_static['physician_id'].isin(test_ids)].copy()
+df_test_set_raw = df_full_static[df_full_static['physician_id'].isin(test_ids)].copy()
+
+print(f"\nTotal Dataset Count: {len(df_static)} Physicians")
+print(f"Training Pool: {len(df_train_pool_raw)} | Unseen Test Set: {len(df_test_set_raw)}")
+
+# Visual EDA
+fig, axes = plt.subplots(1, 3, figsize=(16, 4))
+sns.countplot(data=df_train_pool_raw, x='adopted', ax=axes[0], palette='Set2')
+axes[0].set_title('Target Distribution (Adopted vs Non-Adopted)')
+
+sns.barplot(data=df_train_pool_raw, x='specialty', y='adopted', ax=axes[1], ci=None, palette='viridis')
+axes[1].set_title('Adoption Rate by Specialty')
+axes[1].tick_params(axis='x', rotation=45)
+
+sns.boxplot(data=df_train_pool_raw, x='adopted', y='years_in_practice', ax=axes[2], palette='pastel')
+axes[2].set_title('Years in Practice vs Adoption')
+plt.tight_layout()
+plt.show()
+
+# ------------------------------------------------------------------------------
+# STEP 2: LEAKAGE-FREE FEATURE ENGINEERING
+# ------------------------------------------------------------------------------
+print("\n==================================================================")
+print("--- STEP 2: LEAKAGE-FREE FEATURE ENGINEERING ---")
+print("==================================================================")
+
+agg_totals = df_long.groupby('physician_id').agg(
+    total_rep_calls=('rep_calls', 'sum'),
+    total_samples=('samples_provided', 'sum'),
+    total_digital_engagements=('digital_engagements', 'sum'),
+    total_competitive_rx=('competitive_rx_count', 'sum'),
+    avg_peer_network_score=('peer_network_score', 'mean'),
+    total_med_edu_events=('medical_education_events', 'sum'),
+    total_congress_attendance=('congress_attendance', 'sum')
+).reset_index()
+
+# Recency Window (Q8-Q10)
+q8_10 = df_long[df_long['q_num'] >= 8]
+recency = q8_10.groupby('physician_id').agg(
+    recency_rep_calls=('rep_calls', 'mean'),
+    recency_samples=('samples_provided', 'mean'),
+    recency_digital=('digital_engagements', 'mean'),
+    recency_comp_rx=('competitive_rx_count', 'mean'),
+    speaker_recency_q8_q10=('speaker_program_attendance', 'sum')
+).reset_index()
+
+# Early Window (Q1-Q3)
+q1_3 = df_long[df_long['q_num'] <= 3]
+early = q1_3.groupby('physician_id').agg(
+    early_rep_calls=('rep_calls', 'mean'),
+    early_samples=('samples_provided', 'mean'),
+    early_digital=('digital_engagements', 'mean'),
+    early_comp_rx=('competitive_rx_count', 'mean')
+).reset_index()
+
+features = pd.merge(agg_totals, recency, on='physician_id')
+features = pd.merge(features, early, on='physician_id')
+
+# Dynamic Trends
+features['trend_rep_calls'] = features['recency_rep_calls'] - features['early_rep_calls']
+features['trend_samples'] = features['recency_samples'] - features['early_samples']
+features['trend_digital'] = features['recency_digital'] - features['early_digital']
+features['trend_comp_rx'] = features['recency_comp_rx'] - features['early_comp_rx']
+features.drop(columns=['early_rep_calls', 'early_samples', 'early_digital', 'early_comp_rx', 'recency_comp_rx'], inplace=True)
+
+# Momentum (Monotonic rep calls Q7-Q10)
+def check_monotonic(series):
+    return int(np.all(np.diff(series.values) >= 0))
+
+q7_10 = df_long[df_long['q_num'] >= 7].sort_values(['physician_id', 'q_num'])
+momentum = q7_10.groupby('physician_id')['rep_calls'].apply(check_monotonic).reset_index()
+momentum.columns = ['physician_id', 'rep_calls_momentum_q7_q10']
+features = pd.merge(features, momentum, on='physician_id')
+
+df_full_features = pd.merge(features, df_full_static, on='physician_id')
+
+# Display all engineered features created
+engineered_cols = [c for c in df_full_features.columns if c not in list(df_static.columns) + ['adopted']]
+print(f"\nCreated {len(engineered_cols)} Engineered Features:")
+for idx, col in enumerate(engineered_cols, 1):
+    print(f"  {idx}. {col}")
+
+df_train_pool = df_full_features[~df_full_features['physician_id'].isin(test_ids)].copy().reset_index(drop=True)
+df_test_set = df_full_features[df_full_features['physician_id'].isin(test_ids)].copy().reset_index(drop=True)
+
+# ------------------------------------------------------------------------------
+# STEP 3: STRICT TRAIN/VAL SPLIT & DATA-LEAKAGE SAFE PREPROCESSING
+# ------------------------------------------------------------------------------
+print("\n==================================================================")
+print("--- STEP 3: STRICT TRAIN/VAL SPLIT & STRICT NO-LEAKAGE FITTING ---")
+print("==================================================================")
+
+categorical_cols = ['specialty', 'practice_type', 'geographic_region', 'practice_size']
+numeric_cols = [
+    'years_in_practice', 'hcp_decile', 'payer_access_score', 'kol_flag', 'hospital_affiliation',
+    'board_certified', 'total_rep_calls', 'total_samples', 'total_digital_engagements',
+    'total_competitive_rx', 'avg_peer_network_score', 'total_med_edu_events',
+    'total_congress_attendance', 'recency_rep_calls', 'recency_samples', 'recency_digital',
+    'speaker_recency_q8_q10', 'trend_rep_calls', 'trend_samples', 'trend_digital', 'trend_comp_rx',
+    'rep_calls_momentum_q7_q10'
+]
+
+X_pool = df_train_pool[numeric_cols + categorical_cols + ['territory_code', 'physician_id']].copy()
+y_pool = df_train_pool['adopted'].copy()
+
+# Stratified Train/Val split
+X_train, X_val, y_train, y_val = train_test_split(
+    X_pool, y_pool, test_size=0.20, stratify=y_pool, random_state=RANDOM_STATE
+)
+
+# Impute missing numeric values based STRICTLY on X_train medians
+num_medians = X_train[numeric_cols].median()
+X_train[numeric_cols] = X_train[numeric_cols].fillna(num_medians)
+X_val[numeric_cols] = X_val[numeric_cols].fillna(num_medians)
+df_test_set[numeric_cols] = df_test_set[numeric_cols].fillna(num_medians)
+
+# Territory stats calculated STRICTLY on X_train
+train_territory_stats = X_train.assign(adopted=y_train).groupby('territory_code').agg(
+    territory_avg_rep_calls=('total_rep_calls', 'mean'),
+    territory_adoption_rate=('adopted', 'mean')
+).reset_index()
+
+global_train_adoption_rate = y_train.mean()
+global_train_avg_calls = X_train['total_rep_calls'].mean()
+
+def map_territory_stats(df):
+    df = pd.merge(df, train_territory_stats, on='territory_code', how='left')
+    df['territory_adoption_rate'].fillna(global_train_adoption_rate, inplace=True)
+    df['territory_avg_rep_calls'].fillna(global_train_avg_calls, inplace=True)
+    return df
+
+X_train = map_territory_stats(X_train)
+X_val = map_territory_stats(X_val)
+df_test_set = map_territory_stats(df_test_set)
+
+numeric_cols.extend(['territory_avg_rep_calls', 'territory_adoption_rate'])
+
+# K-Means Clustering fit STRICTLY on X_train
+cluster_cols = ['total_rep_calls', 'total_samples', 'total_digital_engagements', 'avg_peer_network_score']
+scaler_kmeans = StandardScaler()
+train_cluster_scaled = scaler_kmeans.fit_transform(X_train[cluster_cols])
+
+kmeans = KMeans(n_clusters=5, random_state=RANDOM_STATE)
+X_train['physician_cluster'] = kmeans.fit_predict(train_cluster_scaled).astype(str)
+X_val['physician_cluster'] = kmeans.predict(scaler_kmeans.transform(X_val[cluster_cols])).astype(str)
+df_test_set['physician_cluster'] = kmeans.predict(scaler_kmeans.transform(df_test_set[cluster_cols])).astype(str)
+
+categorical_cols.append('physician_cluster')
+
+# VIF Elimination fit STRICTLY on X_train
+def eliminate_vif(df_num, threshold=10.0):
+    scaler_vif = StandardScaler()
+    scaled_array = scaler_vif.fit_transform(df_num)
+    df_scaled = pd.DataFrame(scaled_array, columns=df_num.columns)
+    
+    current_features = list(df_num.columns)
+    while True:
+        vif_series = [variance_inflation_factor(df_scaled[current_features].values, i) for i in range(len(current_features))]
+        max_vif = max(vif_series)
+        if max_vif > threshold:
+            max_feature = current_features[np.argmax(vif_series)]
+            current_features.remove(max_feature)
+        else:
+            break
+    return current_features
+
+numeric_cols_clean = eliminate_vif(X_train[numeric_cols], threshold=10.0)
+print(f"Retained {len(numeric_cols_clean)} Non-Collinear Numeric Features after VIF elimination.")
+
+# ------------------------------------------------------------------------------
+# STEP 4: MIXED EFFECTS / TERRITORY MODELLING
+# ------------------------------------------------------------------------------
+print("\n==================================================================")
+print("--- STEP 4: MIXED EFFECTS & AIC/BIC COMPARISON ---")
+print("==================================================================")
+
+df_mixed = X_train[numeric_cols_clean[:5]].copy()
+df_mixed['adopted'] = y_train.values
+df_mixed['territory_code'] = X_train['territory_code'].values
+
+# Standard Fixed Effects Logit
+X_logit = sm.add_constant(df_mixed[numeric_cols_clean[:5]])
+standard_logit_fit = sm.Logit(df_mixed['adopted'], X_logit).fit(disp=False)
+
+# MixedLM Fit
+mixed_model = smf.mixedlm("adopted ~ " + " + ".join(numeric_cols_clean[:5]), df_mixed, groups=df_mixed["territory_code"])
+mixed_fit = mixed_model.fit()
+
+print(f"Standard Logit AIC: {standard_logit_fit.aic:.2f} | BIC: {standard_logit_fit.bic:.2f}")
+print(f"Mixed Effects LM AIC: {mixed_fit.aic:.2f} | BIC: {mixed_fit.bic:.2f}")
+
+var_random = mixed_fit.cov_re.iloc[0, 0]
+var_residual = (np.pi ** 2) / 3
+icc = var_random / (var_random + var_residual)
+print(f"Intraclass Correlation (ICC): {icc:.4f} ({icc*100:.2f}% adoption variance explained by territory-level effects)")
+
+# ------------------------------------------------------------------------------
+# STEP 5: ENSEMBLE MODELLING, TUNING, FEATURE IMPORTANCES & EVALUATION
+# ------------------------------------------------------------------------------
+print("\n==================================================================")
+print("--- STEP 5: MODEL TRAINING & FEATURE IMPORTANCES ACROSS MODELS ---")
+print("==================================================================")
+
+preprocessor = ColumnTransformer(
+    transformers=[
+        ('num', StandardScaler(), numeric_cols_clean),
+        ('cat', OneHotEncoder(drop='first', handle_unknown='ignore'), categorical_cols)
+    ]
+)
+
+# 5.1 Logistic Regression
+logreg_pipe = Pipeline([
+    ('preprocessor', preprocessor),
+    ('classifier', LogisticRegression(max_iter=1000, random_state=RANDOM_STATE))
+])
+logreg_pipe.fit(X_train[numeric_cols_clean + categorical_cols], y_train)
+
+# 5.2 Random Forest
+rf_pipe = Pipeline([
+    ('preprocessor', preprocessor),
+    ('classifier', RandomForestClassifier(n_estimators=200, max_depth=8, min_samples_leaf=5, oob_score=True, random_state=RANDOM_STATE, n_jobs=-1))
+])
+rf_pipe.fit(X_train[numeric_cols_clean + categorical_cols], y_train)
+print(f"Random Forest OOB Score: {rf_pipe.named_steps['classifier'].oob_score_:.4f}")
+
+# 5.3 XGBoost Optimization
+X_train_trans = preprocessor.fit_transform(X_train[numeric_cols_clean + categorical_cols])
+
+def objective(trial):
+    params = {
+        'n_estimators': trial.suggest_int('n_estimators', 50, 200),
+        'max_depth': trial.suggest_int('max_depth', 3, 5),
+        'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.1, log=True),
+        'random_state': RANDOM_STATE,
+        'eval_metric': 'logloss'
+    }
+    clf = xgb.XGBClassifier(**params)
+    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
+    return cross_val_score(clf, X_train_trans, y_train, cv=cv, scoring='roc_auc', n_jobs=-1).mean()
+
+study = optuna.create_study(direction='maximize')
+study.optimize(objective, n_trials=15)
+
+best_xgb = xgb.XGBClassifier(**study.best_params, random_state=RANDOM_STATE, eval_metric='logloss')
+xgb_pipe = Pipeline([
+    ('preprocessor', preprocessor),
+    ('classifier', best_xgb)
+])
+xgb_pipe.fit(X_train[numeric_cols_clean + categorical_cols], y_train)
+
+# Feature Names Extraction
+cat_encoder = rf_pipe.named_steps['preprocessor'].named_transformers_['cat']
+encoded_cat_cols = cat_encoder.get_feature_names_out(categorical_cols).tolist()
+all_feature_names = numeric_cols_clean + encoded_cat_cols
+
+# Independent Feature Importances Extraction
+lr_coefs = pd.Series(logreg_pipe.named_steps['classifier'].coef_[0], index=all_feature_names)
+rf_importances = pd.Series(rf_pipe.named_steps['classifier'].feature_importances_, index=all_feature_names)
+xgb_importances = pd.Series(xgb_pipe.named_steps['classifier'].feature_importances_, index=all_feature_names)
+
+print("\n--- STANDALONE LOGISTIC REGRESSION TOP-10 COEFFICIENTS (INDEPENDENT) ---")
+print(lr_coefs.abs().nlargest(10))
+
+print("\n--- STANDALONE RANDOM FOREST TOP-10 FEATURE IMPORTANCES (INDEPENDENT) ---")
+print(rf_importances.nlargest(10))
+
+print("\n--- TOP-10 FEATURES COMPARISON TABLE ACROSS ALL 3 MODELS ---")
+top10_all_models = pd.DataFrame({
+    'LogReg Abs Coeff': lr_coefs.abs().nlargest(10),
+    'Random Forest Importance': rf_importances.loc[lr_coefs.abs().nlargest(10).index],
+    'XGBoost Importance': xgb_importances.loc[lr_coefs.abs().nlargest(10).index]
+})
+print(top10_all_models)
+
+# ------------------------------------------------------------------------------
+# STEP 5.4: INDIVIDUAL VALIDATION REPORTS & METRIC COMPARISONS
+# ------------------------------------------------------------------------------
+X_val_input = X_val[numeric_cols_clean + categorical_cols]
+
+y_val_proba_lr = logreg_pipe.predict_proba(X_val_input)[:, 1]
+y_val_proba_rf = rf_pipe.predict_proba(X_val_input)[:, 1]
+y_val_proba_xgb = xgb_pipe.predict_proba(X_val_input)[:, 1]
+
+y_val_pred_lr = (y_val_proba_lr >= 0.5).astype(int)
+y_val_pred_rf = (y_val_proba_rf >= 0.5).astype(int)
+y_val_pred_xgb = (y_val_proba_xgb >= 0.5).astype(int)
+
+print("\n==================================================================")
+print("--- INDIVIDUAL MODEL VALIDATION CLASSIFICATION REPORTS ---")
+print("==================================================================")
+
+print("\n>>> 1. Logistic Regression Classification Report:")
+print(classification_report(y_val, y_val_pred_lr))
+
+print("\n>>> 2. Random Forest Classification Report:")
+print(classification_report(y_val, y_val_pred_rf))
+
+print("\n>>> 3. XGBoost (Gradient Boosting) Classification Report:")
+print(classification_report(y_val, y_val_pred_xgb))
+
+# Comprehensive Table including ACCURACY
+detailed_perf = pd.DataFrame({
+    'Model': ['Logistic Regression', 'Random Forest', 'Gradient Boosting (XGBoost)'],
+    'Accuracy': [
+        accuracy_score(y_val, y_val_pred_lr),
+        accuracy_score(y_val, y_val_pred_rf),
+        accuracy_score(y_val, y_val_pred_xgb)
+    ],
+    'ROC-AUC': [
+        roc_auc_score(y_val, y_val_proba_lr),
+        roc_auc_score(y_val, y_val_proba_rf),
+        roc_auc_score(y_val, y_val_proba_xgb)
+    ],
+    'PR-AUC (AP)': [
+        average_precision_score(y_val, y_val_proba_lr),
+        average_precision_score(y_val, y_val_proba_rf),
+        average_precision_score(y_val, y_val_proba_xgb)
+    ],
+    'F1-Score': [
+        f1_score(y_val, y_val_pred_lr),
+        f1_score(y_val, y_val_pred_rf),
+        f1_score(y_val, y_val_pred_xgb)
+    ],
+    'Precision': [
+        precision_score(y_val, y_val_pred_lr),
+        precision_score(y_val, y_val_pred_rf),
+        precision_score(y_val, y_val_pred_xgb)
+    ],
+    'Recall': [
+        recall_score(y_val, y_val_pred_lr),
+        recall_score(y_val, y_val_pred_rf),
+        recall_score(y_val, y_val_pred_xgb)
+    ]
+})
+
+print("\n==================================================================")
+print("=== DETAILED MODEL PERFORMANCE COMPARISON TABLE (WITH ACCURACY) ===")
+print("==================================================================")
+print(detailed_perf.to_string(index=False))
+
+# Plot ROC & PR Curves
+fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+for name, proba in zip(['Logistic Regression', 'Random Forest', 'XGBoost'], [y_val_proba_lr, y_val_proba_rf, y_val_proba_xgb]):
+    fpr, tpr, _ = roc_curve(y_val, proba)
+    axes[0].plot(fpr, tpr, label=f'{name} (ROC AUC = {roc_auc_score(y_val, proba):.3f})')
+axes[0].plot([0, 1], [0, 1], 'k--')
+axes[0].set_title('Validation ROC Curves')
+axes[0].set_xlabel('False Positive Rate')
+axes[0].set_ylabel('True Positive Rate')
+axes[0].legend()
+
+for name, proba in zip(['Logistic Regression', 'Random Forest', 'XGBoost'], [y_val_proba_lr, y_val_proba_rf, y_val_proba_xgb]):
+    precision, recall, _ = precision_recall_curve(y_val, proba)
+    pr_auc = average_precision_score(y_val, proba)
+    axes[1].plot(recall, precision, label=f'{name} (PR AUC = {pr_auc:.3f})')
+axes[1].set_title('Validation Precision-Recall (PR) Curves')
+axes[1].set_xlabel('Recall')
+axes[1].set_ylabel('Precision')
+axes[1].legend()
+
+plt.tight_layout()
+plt.show()
+
+# ------------------------------------------------------------------------------
+# STEP 6: TEST SET PREDICTIONS & TOP 200 TARGET FLAGS PRINTING
+# ------------------------------------------------------------------------------
+print("\n==================================================================")
+print("--- STEP 6 & DELIVERABLE 2: PREDICTIONS & TOP 200 TARGET FLAGS ---")
+print("==================================================================")
+
+# Change this variable to logreg_pipe, rf_pipe, or xgb_pipe as needed
+final_model = logreg_pipe 
+
+X_test_input = df_test_set[numeric_cols_clean + categorical_cols]
+
+df_test_set['adoption_probability'] = final_model.predict_proba(X_test_input)[:, 1]
+df_test_set['adoption_prediction'] = (df_test_set['adoption_probability'] >= 0.5).astype(int)
+
+# Rank descending
+df_test_set = df_test_set.sort_values('adoption_probability', ascending=False).reset_index(drop=True)
+
+# Add Top 200 Target Flag (1 for top 200, 0 for rest)
+df_test_set['top_200_target_flag'] = 0
+df_test_set.loc[:199, 'top_200_target_flag'] = 1
+
+feature_input_columns = numeric_cols_clean + categorical_cols
+deliverable2_columns = ['physician_id', 'adoption_probability', 'adoption_prediction', 'top_200_target_flag'] + feature_input_columns
+
+df_predictions_csv = df_test_set[deliverable2_columns]
+df_predictions_csv.to_csv('predictions.csv', index=False)
+
+top_200_q11_targets = df_predictions_csv[df_predictions_csv['top_200_target_flag'] == 1]
+top_200_q11_targets.to_excel('top_200_targets_q11.xlsx', index=False)
+
+print("\n--- TOP 200 TARGETS SUMMARY STATISTICS ---")
+print(f"Total Test Physicians Processed: {len(df_predictions_csv)}")
+print(f"Top 200 Target Threshold Probability Min: {top_200_q11_targets['adoption_probability'].min():.4f}")
+print(f"Top 200 Target Average Adoption Probability: {top_200_q11_targets['adoption_probability'].mean():.4f}")
+
+print("\n--- TOP 20 HIGH-PRIORITY TARGET PHYSICIANS (SAMPLE PRINT) ---")
+print(top_200_q11_targets[['physician_id', 'adoption_probability', 'adoption_prediction', 'top_200_target_flag', 'specialty']].head(20).to_string(index=False))
