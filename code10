@@ -1,0 +1,1599 @@
+
+# ================================================================
+# ABC PHARMACEUTICALS - DRUG XYZ Q11 ADOPTION
+# END-TO-END, LEAKAGE-SAFE, REPRODUCIBLE PIPELINE
+# ================================================================
+#
+# Problem:
+#   Predict probability of FIRST adoption of Drug XYZ in Q11 for
+#   the 1,502 physicians in test_physicians.csv.
+#
+# IMPORTANT LEAKAGE RULES USED HERE
+# ---------------------------------
+# 1. test_physicians.csv is NEVER used to fit preprocessing, scaling,
+#    imputation, clustering, model selection, or target-derived features.
+# 2. physician-level train/validation split is performed BEFORE any
+#    supervised EDA/model fitting.
+# 3. rx_count is used ONLY to construct the training target and is
+#    NEVER used as a predictor.
+# 4. Target-derived territory adoption rate is calculated from TRAIN
+#    physicians only and then mapped to validation/test.
+# 5. K-Means is fitted on TRAIN physicians only.
+# 6. Imputation, scaling, encoding and SMOTE are fitted/applied only
+#    inside the training side of each model fit.
+# 7. Final model is selected using validation performance, then refit
+#    on all labelled training physicians before Q11 prediction.
+#
+# Expected input files:
+#   input_data_file1.csv
+#   input_data_file2.csv
+#   test_physicians.csv
+#
+# If filenames differ, the script automatically searches the working
+# directory for CSVs and identifies them using their columns.
+#
+# Outputs:
+#   predictions.csv
+#   model_comparison.csv
+#   feature_importance.csv
+#   logistic_coefficients.csv
+#   eda_class_balance.csv
+#   territory_adoption_rates.csv
+#   plots/*.png
+# ================================================================
+
+import os
+import re
+import glob
+import warnings
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+
+warnings.filterwarnings("ignore")
+
+SEED = 42
+np.random.seed(SEED)
+
+# -----------------------------
+# 0. Optional / required imports
+# -----------------------------
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+from sklearn.base import clone
+from sklearn.cluster import KMeans
+from sklearn.compose import ColumnTransformer
+from sklearn.impute import SimpleImputer
+from sklearn.inspection import permutation_importance
+from sklearn.linear_model import LogisticRegression, LinearRegression
+from sklearn.metrics import (
+    accuracy_score, balanced_accuracy_score, precision_score, recall_score,
+    f1_score, roc_auc_score, average_precision_score, log_loss,
+    matthews_corrcoef, confusion_matrix, roc_curve, precision_recall_curve,
+    classification_report
+)
+from sklearn.model_selection import (
+    train_test_split, StratifiedKFold, cross_val_score
+)
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.feature_selection import mutual_info_classif
+
+try:
+    from imblearn.pipeline import Pipeline as ImbPipeline
+    from imblearn.over_sampling import SMOTETomek
+    IMBLEARN_AVAILABLE = True
+except Exception:
+    IMBLEARN_AVAILABLE = False
+    ImbPipeline = Pipeline
+    SMOTETomek = None
+
+try:
+    from xgboost import XGBClassifier
+    XGB_AVAILABLE = True
+except Exception:
+    XGB_AVAILABLE = False
+
+try:
+    import statsmodels.api as sm
+    from statsmodels.stats.outliers_influence import variance_inflation_factor
+    STATSMODELS_AVAILABLE = True
+except Exception:
+    STATSMODELS_AVAILABLE = False
+
+# -----------------------------
+# 1. Paths and input discovery
+# -----------------------------
+BASE_DIR = Path.cwd()
+OUTPUT_DIR = BASE_DIR / "ml102b_outputs"
+PLOT_DIR = OUTPUT_DIR / "plots"
+OUTPUT_DIR.mkdir(exist_ok=True)
+PLOT_DIR.mkdir(exist_ok=True)
+
+def find_csv_by_columns(required_columns, preferred_names=None):
+    """Find a CSV by required column names, without hard-coding the folder."""
+    preferred_names = preferred_names or []
+    candidates = []
+
+    for name in preferred_names:
+        p = BASE_DIR / name
+        if p.exists():
+            candidates.append(p)
+
+    candidates.extend([Path(x) for x in glob.glob(str(BASE_DIR / "*.csv"))])
+
+    seen = set()
+    for p in candidates:
+        if p in seen:
+            continue
+        seen.add(p)
+        try:
+            cols = set(pd.read_csv(p, nrows=5).columns.astype(str))
+            if set(required_columns).issubset(cols):
+                return p
+        except Exception:
+            pass
+
+    return None
+
+file1 = find_csv_by_columns(
+    ["physician_id", "quarter", "rx_count", "rep_calls",
+     "samples_provided", "digital_engagements", "competitive_rx_count"],
+    ["input_data_file1.csv", "input_data_file1 (1).csv"]
+)
+
+file2 = find_csv_by_columns(
+    ["physician_id", "specialty", "years_in_practice", "practice_type",
+     "geographic_region", "territory_code", "hcp_decile", "payer_access_score"],
+    ["input_data_file2.csv", "input_data_file2 (1).csv"]
+)
+
+test_file = find_csv_by_columns(
+    ["physician_id"],
+    ["test_physicians.csv", "test_physicians (1).csv"]
+)
+
+if file1 is None or file2 is None or test_file is None:
+    raise FileNotFoundError(
+        "\nCould not automatically identify all three CSV files.\n"
+        f"Working directory: {BASE_DIR}\n"
+        "Required files/columns:\n"
+        "  file1: physician_id, quarter, rx_count, rep_calls, samples_provided, "
+        "digital_engagements, competitive_rx_count\n"
+        "  file2: physician_id, specialty, years_in_practice, practice_type, "
+        "geographic_region, territory_code, hcp_decile, payer_access_score\n"
+        "  test: physician_id\n"
+        "Place the CSVs in the working directory and rerun."
+    )
+
+print("INPUT FILES")
+print("Behavioral:", file1)
+print("Profile   :", file2)
+print("Test IDs  :", test_file)
+
+# -----------------------------
+# 2. Load data
+# -----------------------------
+behavior = pd.read_csv(file1)
+profile = pd.read_csv(file2)
+test_ids = pd.read_csv(test_file)
+
+behavior["physician_id"] = behavior["physician_id"].astype(str)
+profile["physician_id"] = profile["physician_id"].astype(str)
+test_ids["physician_id"] = test_ids["physician_id"].astype(str)
+
+test_ids = test_ids[["physician_id"]].drop_duplicates().copy()
+
+# Clean quarter
+behavior["quarter"] = behavior["quarter"].astype(str).str.upper().str.strip()
+behavior["quarter_num"] = (
+    behavior["quarter"].str.extract(r"(\d+)")[0].astype(float)
+)
+behavior = behavior.sort_values(["physician_id", "quarter_num"])
+
+# Numeric conversion where appropriate
+behavior_num_cols = [
+    "rx_count", "rep_calls", "samples_provided", "digital_engagements",
+    "speaker_program_attendance", "congress_attendance",
+    "competitive_rx_count", "peer_network_score",
+    "medical_education_events"
+]
+for c in behavior_num_cols:
+    if c in behavior.columns:
+        behavior[c] = pd.to_numeric(behavior[c], errors="coerce")
+
+profile_num_cols = [
+    "years_in_practice", "hcp_decile", "payer_access_score",
+    "kol_flag", "hospital_affiliation", "board_certified"
+]
+for c in profile_num_cols:
+    if c in profile.columns:
+        profile[c] = pd.to_numeric(profile[c], errors="coerce")
+
+# Ensure profile is one row per physician
+profile = profile.drop_duplicates("physician_id", keep="first")
+
+# Merge only after loading/cleaning
+full = behavior.merge(profile, on="physician_id", how="left", validate="many_to_one")
+
+# -----------------------------
+# 3. Define target
+# -----------------------------
+adoption_label = (
+    behavior.groupby("physician_id")["rx_count"]
+    .max()
+    .fillna(0)
+    .gt(0)
+    .astype(int)
+    .rename("adopted")
+)
+
+physician_universe = pd.DataFrame({
+    "physician_id": full["physician_id"].unique()
+}).merge(adoption_label, on="physician_id", how="left")
+
+physician_universe["adopted"] = physician_universe["adopted"].fillna(0).astype(int)
+
+test_set = set(test_ids["physician_id"])
+physician_universe["is_test"] = physician_universe["physician_id"].isin(test_set)
+
+# Sanity check from problem statement
+print("\nTARGET / TEST SANITY CHECK")
+print("Total physicians:", physician_universe["physician_id"].nunique())
+print("Test physicians :", len(test_set))
+print("Test physicians with historical rx > 0:",
+      int(adoption_label.reindex(test_ids["physician_id"]).fillna(0).sum()))
+
+if len(test_set) != 1502:
+    print("WARNING: Expected 1,502 test physicians according to the problem statement.")
+
+# -----------------------------
+# 4. Train/validation split FIRST
+# -----------------------------
+# The fixed 1,502 Q11 target physicians are never part of the labelled
+# train/validation modelling set.
+labelled_ids = physician_universe.loc[
+    ~physician_universe["is_test"], "physician_id"
+].values
+labelled_y = physician_universe.set_index("physician_id").loc[labelled_ids, "adopted"].values
+
+train_ids, valid_ids = train_test_split(
+    labelled_ids,
+    test_size=0.20,
+    random_state=SEED,
+    stratify=labelled_y
+)
+
+train_ids = set(train_ids)
+valid_ids = set(valid_ids)
+
+print("\nPHYSICIAN-LEVEL HOLDOUT")
+print("Train physicians:", len(train_ids))
+print("Validation physicians:", len(valid_ids))
+print("Test physicians:", len(test_set))
+
+# -----------------------------
+# 5. Simple EDA - TRAIN ONLY
+# -----------------------------
+train_beh = behavior[behavior["physician_id"].isin(train_ids)].copy()
+train_prof = profile[profile["physician_id"].isin(train_ids)].copy()
+train_labels = adoption_label.reindex(list(train_ids)).fillna(0).astype(int)
+
+print("\n================ SIMPLE EDA: TRAIN ONLY ================")
+print("Train class balance:")
+print(train_labels.value_counts().sort_index())
+print(train_labels.value_counts(normalize=True).sort_index())
+
+eda_balance = pd.DataFrame({
+    "class": train_labels.value_counts().sort_index().index,
+    "count": train_labels.value_counts().sort_index().values,
+    "percentage": (train_labels.value_counts(normalize=True).sort_index().values * 100)
+})
+eda_balance.to_csv(OUTPUT_DIR / "eda_class_balance.csv", index=False)
+
+# Missing values
+missing_train = train_beh.isna().mean().sort_values(ascending=False).reset_index()
+missing_train.columns = ["column", "missing_fraction"]
+missing_train["missing_percentage"] = missing_train["missing_fraction"] * 100
+missing_train.to_csv(OUTPUT_DIR / "eda_missing_values.csv", index=False)
+
+print("\nTop missing-value percentages:")
+print(missing_train.head(15).to_string(index=False))
+
+# Distributions / outliers
+numeric_eda = [
+    c for c in behavior_num_cols
+    if c in train_beh.columns and c != "rx_count"
+]
+
+eda_summary = []
+for c in numeric_eda:
+    s = pd.to_numeric(train_beh[c], errors="coerce")
+    q1, q3 = s.quantile([0.25, 0.75])
+    iqr = q3 - q1
+    lo = q1 - 1.5 * iqr
+    hi = q3 + 1.5 * iqr
+    eda_summary.append({
+        "feature": c,
+        "mean": s.mean(),
+        "median": s.median(),
+        "std": s.std(),
+        "min": s.min(),
+        "max": s.max(),
+        "outlier_count_iqr": int(((s < lo) | (s > hi)).sum())
+    })
+pd.DataFrame(eda_summary).to_csv(OUTPUT_DIR / "eda_outlier_summary.csv", index=False)
+
+# Class balance plot
+plt.figure(figsize=(6, 4))
+sns.countplot(x=train_labels.values)
+plt.title("Training Class Balance")
+plt.xlabel("Adopted")
+plt.ylabel("Physician count")
+plt.tight_layout()
+plt.savefig(PLOT_DIR / "class_balance.png", dpi=150)
+plt.close()
+
+# Specialty / region adoption rate for TRAIN only
+if "specialty" in train_prof.columns:
+    tmp = train_prof[["physician_id", "specialty"]].merge(
+        adoption_label.rename("adopted"),
+        left_on="physician_id", right_index=True, how="left"
+    )
+    spec_rate = tmp.groupby("specialty")["adopted"].agg(["mean", "count"]).reset_index()
+    print("\nAdoption rate by specialty (TRAIN):")
+    print(spec_rate.to_string(index=False))
+    spec_rate.to_csv(OUTPUT_DIR / "eda_specialty_adoption.csv", index=False)
+
+if "geographic_region" in train_prof.columns:
+    tmp = train_prof[["physician_id", "geographic_region"]].merge(
+        adoption_label.rename("adopted"),
+        left_on="physician_id", right_index=True, how="left"
+    )
+    reg_rate = tmp.groupby("geographic_region")["adopted"].agg(["mean", "count"]).reset_index()
+    print("\nAdoption rate by region (TRAIN):")
+    print(reg_rate.to_string(index=False))
+    reg_rate.to_csv(OUTPUT_DIR / "eda_region_adoption.csv", index=False)
+
+# -----------------------------
+# 6. Raw numeric OLS on TRAIN ONLY
+# -----------------------------
+# This is explicitly requested by the problem statement.
+# OLS is used for association/EDA, not as the final classifier.
+ols_features = [
+    c for c in ["rep_calls", "samples_provided", "digital_engagements"]
+    if c in train_beh.columns
+]
+
+if STATSMODELS_AVAILABLE and len(ols_features) > 0:
+    raw_ols = (
+        train_beh.groupby("physician_id")[ols_features]
+        .sum()
+        .merge(adoption_label.rename("adopted"),
+               left_index=True, right_index=True, how="left")
+        .reset_index()
+    )
+    X_ols = raw_ols[ols_features].apply(pd.to_numeric, errors="coerce")
+    X_ols = X_ols.fillna(X_ols.median())
+    X_ols = sm.add_constant(X_ols, has_constant="add")
+    y_ols = raw_ols["adopted"].astype(float)
+
+    ols_model = sm.OLS(y_ols, X_ols).fit()
+    print("\n================ OLS ASSOCIATION ANALYSIS ================")
+    print(ols_model.summary())
+
+    ols_table = pd.DataFrame({
+        "feature": ols_model.params.index,
+        "coefficient": ols_model.params.values,
+        "p_value": ols_model.pvalues.values
+    })
+    ols_table.to_csv(OUTPUT_DIR / "ols_results.csv", index=False)
+else:
+    print("\nStatsmodels unavailable: OLS section skipped safely.")
+
+# -----------------------------
+# 7. Base longitudinal feature engineering
+# -----------------------------
+ACTIVITY_FEATURES = [
+    "rep_calls",
+    "samples_provided",
+    "digital_engagements",
+    "speaker_program_attendance",
+    "congress_attendance",
+    "competitive_rx_count",
+    "peer_network_score",
+    "medical_education_events"
+]
+
+def safe_numeric_series(df, col):
+    if col not in df.columns:
+        return pd.Series(np.nan, index=df.index, dtype=float)
+    return pd.to_numeric(df[col], errors="coerce")
+
+def engineer_base_features(behavior_df, profile_df):
+    """
+    Creates physician-level features using only raw predictor variables.
+    rx_count is deliberately excluded from all model features.
+    """
+    b = behavior_df.copy()
+    b["quarter_num"] = pd.to_numeric(b["quarter_num"], errors="coerce")
+    b = b.sort_values(["physician_id", "quarter_num"])
+
+    rows = []
+
+    for pid, g in b.groupby("physician_id", sort=False):
+        g = g.sort_values("quarter_num").copy()
+        row = {"physician_id": pid}
+
+        qnums = g["quarter_num"].values
+
+        # Aggregate totals / mean / max / std
+        for c in ACTIVITY_FEATURES:
+            s = safe_numeric_series(g, c)
+            row[f"{c}_total"] = s.sum(min_count=1)
+            row[f"{c}_mean"] = s.mean()
+            row[f"{c}_std"] = s.std()
+            row[f"{c}_max"] = s.max()
+
+            recent = s[g["quarter_num"].isin([8, 9, 10])]
+            early = s[g["quarter_num"].isin([1, 2, 3])]
+            row[f"{c}_recent3_mean"] = recent.mean()
+            row[f"{c}_early3_mean"] = early.mean()
+            row[f"{c}_trend_recent_vs_early"] = (
+                recent.mean() - early.mean()
+            )
+
+        # Recency: Q8-Q10
+        recent_g = g[g["quarter_num"].isin([8, 9, 10])]
+        row["speaker_recency_q8_q10"] = safe_numeric_series(
+            recent_g, "speaker_program_attendance"
+        ).sum(min_count=1)
+
+        # Last-quarter levels
+        q10 = g[g["quarter_num"] == 10]
+        for c in ACTIVITY_FEATURES:
+            row[f"{c}_q10"] = safe_numeric_series(q10, c).mean()
+
+        # Q9 -> Q10 changes
+        q9 = g[g["quarter_num"] == 9]
+        for c in ACTIVITY_FEATURES:
+            v9 = safe_numeric_series(q9, c).mean()
+            v10 = safe_numeric_series(q10, c).mean()
+            row[f"{c}_q10_minus_q9"] = v10 - v9
+
+        # -------------------------
+        # Momentum features
+        # -------------------------
+        # "Momentum" = monotonic increase over the last four quarters.
+        # Also add a slope and a simple positive-change flag.
+        last4 = g[g["quarter_num"].isin([7, 8, 9, 10])].sort_values("quarter_num")
+
+        for c in [
+            "rep_calls", "samples_provided", "digital_engagements",
+            "competitive_rx_count", "peer_network_score",
+            "medical_education_events"
+        ]:
+            vals = safe_numeric_series(last4, c).dropna().values
+
+            if len(vals) >= 4:
+                diffs = np.diff(vals)
+                monotonic = int(np.all(diffs >= 0) and np.any(diffs > 0))
+                positive_steps = int(np.sum(diffs > 0))
+                # polyfit slope
+                x = np.arange(len(vals), dtype=float)
+                slope = float(np.polyfit(x, vals, 1)[0])
+            else:
+                monotonic = 0
+                positive_steps = np.nan
+                slope = np.nan
+
+            row[f"{c}_momentum"] = monotonic
+            row[f"{c}_positive_steps_last4"] = positive_steps
+            row[f"{c}_slope_last4"] = slope
+
+        # Overall engagement intensity
+        row["total_engagement_intensity"] = (
+            row.get("rep_calls_total", 0)
+            + row.get("samples_provided_total", 0)
+            + row.get("digital_engagements_total", 0)
+        )
+
+        # Rep-call / digital engagement ratio
+        row["rep_to_digital_ratio"] = (
+            row["rep_calls_total"] /
+            (row["digital_engagements_total"] + 1.0)
+        )
+
+        # Sample intensity per rep call
+        row["samples_per_rep_call"] = (
+            row["samples_provided_total"] /
+            (row["rep_calls_total"] + 1.0)
+        )
+
+        rows.append(row)
+
+    feat = pd.DataFrame(rows)
+
+    # Merge static profile variables
+    prof_cols = [
+        "physician_id", "specialty", "years_in_practice", "practice_type",
+        "geographic_region", "state", "territory_code", "hcp_decile",
+        "payer_access_score", "kol_flag", "hospital_affiliation",
+        "board_certified", "practice_size"
+    ]
+    prof_cols = [c for c in prof_cols if c in profile_df.columns]
+    feat = feat.merge(
+        profile_df[prof_cols].drop_duplicates("physician_id"),
+        on="physician_id", how="left"
+    )
+
+    return feat
+
+base_features = engineer_base_features(behavior, profile)
+
+# -----------------------------
+# 8. Correlation + VIF on TRAIN ONLY
+# -----------------------------
+# Build train-only numeric feature matrix.
+train_base = base_features[base_features["physician_id"].isin(train_ids)].copy()
+
+numeric_candidates = train_base.select_dtypes(include=[np.number]).columns.tolist()
+numeric_candidates = [c for c in numeric_candidates if c != "physician_id"]
+
+# Drop constants
+constant_features = [
+    c for c in numeric_candidates
+    if train_base[c].nunique(dropna=True) <= 1
+]
+
+numeric_for_corr = [c for c in numeric_candidates if c not in constant_features]
+
+if len(numeric_for_corr) >= 2:
+    corr = train_base[numeric_for_corr].corr(numeric_only=True)
+    corr.to_csv(OUTPUT_DIR / "correlation_matrix_train_only.csv")
+
+    plt.figure(figsize=(14, 10))
+    sns.heatmap(corr, cmap="coolwarm", center=0, linewidths=0.1)
+    plt.title("Training Numeric Feature Correlation")
+    plt.tight_layout()
+    plt.savefig(PLOT_DIR / "correlation_heatmap_train.png", dpi=150)
+    plt.close()
+
+# VIF can become unstable with highly redundant engineered features.
+# We calculate it on a finite, standardized training matrix and safely
+# skip a feature when the matrix is singular.
+vif_rows = []
+if STATSMODELS_AVAILABLE and len(numeric_for_corr) >= 2:
+    X_vif = train_base[numeric_for_corr].copy()
+    X_vif = X_vif.replace([np.inf, -np.inf], np.nan)
+    X_vif = X_vif.apply(pd.to_numeric, errors="coerce")
+    X_vif = X_vif.fillna(X_vif.median(numeric_only=True))
+    X_vif = X_vif.fillna(0)
+
+    # Remove constant columns again after imputation
+    keep_vif = [c for c in X_vif.columns if X_vif[c].nunique() > 1]
+    X_vif = X_vif[keep_vif]
+
+    if X_vif.shape[1] >= 2:
+        X_vif_std = pd.DataFrame(
+            StandardScaler().fit_transform(X_vif),
+            columns=X_vif.columns
+        )
+
+        for i, c in enumerate(X_vif_std.columns):
+            try:
+                value = variance_inflation_factor(X_vif_std.values, i)
+                if not np.isfinite(value):
+                    value = 999999.0
+            except Exception:
+                value = 999999.0
+            vif_rows.append({"feature": c, "VIF": value})
+
+vif_df = pd.DataFrame(vif_rows).sort_values("VIF", ascending=False) if vif_rows else pd.DataFrame()
+vif_df.to_csv(OUTPUT_DIR / "vif_train_only.csv", index=False)
+
+if not vif_df.empty:
+    print("\nTop VIF values:")
+    print(vif_df.head(15).to_string(index=False))
+
+# -----------------------------
+# 9. Remove obvious redundant features
+# -----------------------------
+# We do NOT blindly remove every VIF > 10 because engineered time-series
+# variables are naturally correlated. Instead, we use a correlation-based
+# reduction for extremely redundant pairs, while keeping meaningful
+# momentum/trend variables.
+#
+# This avoids unstable logistic coefficients while preserving the requested
+# feature-engineering logic.
+def correlation_reduction(df, numeric_cols, threshold=0.97):
+    cols = [c for c in numeric_cols if c in df.columns]
+    if len(cols) < 2:
+        return []
+
+    tmp = df[cols].copy()
+    tmp = tmp.replace([np.inf, -np.inf], np.nan)
+    tmp = tmp.fillna(tmp.median(numeric_only=True)).fillna(0)
+
+    corr = tmp.corr().abs()
+    upper = corr.where(np.triu(np.ones(corr.shape), k=1).astype(bool))
+
+    drop = []
+    for col in upper.columns:
+        if (upper[col] > threshold).any():
+            # Prefer retaining explicitly engineered trend/momentum features.
+            if "momentum" in col or "trend" in col or "slope" in col:
+                continue
+            drop.append(col)
+    return sorted(set(drop))
+
+corr_drop = correlation_reduction(train_base, numeric_for_corr, 0.97)
+
+# -----------------------------
+# 10. Territory-level features
+# -----------------------------
+# Non-target territory activity can be computed for everyone because it is
+# based on predictors. Territory adoption rate is target-derived and MUST
+# be fit from TRAIN ONLY.
+def add_territory_features(feature_df, behavior_df, profile_df, fit_ids):
+    out = feature_df.copy()
+
+    # Activity by territory based on all rows belonging to fit_ids.
+    fit_beh = behavior_df[
+        behavior_df["physician_id"].isin(fit_ids)
+    ].copy()
+
+    territory_map = profile_df[
+        profile_df["physician_id"].isin(fit_ids)
+    ][["physician_id", "territory_code"]].drop_duplicates("physician_id")
+
+    fit_beh = fit_beh.merge(territory_map, on="physician_id", how="left")
+
+    if "territory_code" in fit_beh.columns:
+        terr_activity = (
+            fit_beh.groupby("territory_code")
+            .agg(
+                territory_avg_rep_calls=("rep_calls", "mean"),
+                territory_avg_samples=("samples_provided", "mean"),
+                territory_avg_digital=("digital_engagements", "mean"),
+                territory_avg_competitor_rx=("competitive_rx_count", "mean")
+            )
+            .reset_index()
+        )
+
+        out = out.merge(terr_activity, on="territory_code", how="left")
+
+    # Target-derived adoption rate: TRAIN ONLY.
+    fit_label = adoption_label.reindex(list(fit_ids)).dropna().astype(int)
+    fit_prof = profile_df[
+        profile_df["physician_id"].isin(fit_ids)
+    ][["physician_id", "territory_code"]].drop_duplicates("physician_id")
+
+    terr_y = fit_prof.merge(
+        fit_label.rename("adopted"),
+        left_on="physician_id", right_index=True, how="inner"
+    )
+
+    if not terr_y.empty:
+        global_rate = float(terr_y["adopted"].mean())
+        terr_rate = (
+            terr_y.groupby("territory_code")["adopted"]
+            .agg(["mean", "count"])
+            .reset_index()
+        )
+        terr_rate["smoothed_territory_adoption_rate"] = (
+            terr_rate["mean"] * terr_rate["count"] +
+            global_rate * 10
+        ) / (terr_rate["count"] + 10)
+
+        terr_rate = terr_rate[
+            ["territory_code", "smoothed_territory_adoption_rate"]
+        ]
+
+        out = out.merge(terr_rate, on="territory_code", how="left")
+
+        # Save for audit
+        terr_rate.to_csv(OUTPUT_DIR / "territory_adoption_rates_train_only.csv", index=False)
+
+    return out
+
+features_with_territory = add_territory_features(
+    base_features, behavior, profile, train_ids
+)
+
+# -----------------------------
+# 11. K-Means behavioural segmentation
+# -----------------------------
+# Fit K-Means ONLY on training physicians.
+cluster_numeric = [
+    c for c in [
+        "rep_calls_total", "samples_provided_total",
+        "digital_engagements_total", "rep_calls_recent3_mean",
+        "samples_provided_recent3_mean", "digital_engagements_recent3_mean",
+        "rep_calls_trend_recent_vs_early",
+        "digital_engagements_trend_recent_vs_early",
+        "competitive_rx_count_trend_recent_vs_early",
+        "peer_network_score_recent3_mean",
+        "rep_calls_momentum", "digital_engagements_momentum"
+    ]
+    if c in features_with_territory.columns
+]
+
+def add_clusters(train_feature_df, all_feature_df, n_clusters=5):
+    tr = train_feature_df[cluster_numeric].copy()
+    allx = all_feature_df[cluster_numeric].copy()
+
+    tr = tr.replace([np.inf, -np.inf], np.nan)
+    allx = allx.replace([np.inf, -np.inf], np.nan)
+
+    med = tr.median(numeric_only=True)
+    tr = tr.fillna(med).fillna(0)
+    allx = allx.fillna(med).fillna(0)
+
+    scaler = StandardScaler()
+    tr_scaled = scaler.fit_transform(tr)
+    all_scaled = scaler.transform(allx)
+
+    km = KMeans(
+        n_clusters=n_clusters,
+        random_state=SEED,
+        n_init=20
+    )
+    km.fit(tr_scaled)
+
+    result = all_feature_df.copy()
+    result["behavior_cluster"] = km.predict(all_scaled)
+    return result, km, scaler
+
+train_ft = features_with_territory[
+    features_with_territory["physician_id"].isin(train_ids)
+].copy()
+
+features_all, kmeans_model, cluster_scaler = add_clusters(
+    train_ft, features_with_territory, n_clusters=5
+)
+
+print("\nBehavioural clusters:")
+print(
+    features_all.loc[features_all["physician_id"].isin(train_ids),
+                     "behavior_cluster"].value_counts().sort_index()
+)
+
+# -----------------------------
+# 12. Assemble train/valid/test
+# -----------------------------
+# Test is identified ONLY by test_physicians.csv.
+# No test labels are used.
+train_df = features_all[features_all["physician_id"].isin(train_ids)].copy()
+valid_df = features_all[features_all["physician_id"].isin(valid_ids)].copy()
+test_df = features_all[features_all["physician_id"].isin(test_set)].copy()
+
+y_train = adoption_label.reindex(train_df["physician_id"]).astype(int).values
+y_valid = adoption_label.reindex(valid_df["physician_id"]).astype(int).values
+
+# Check one row per physician
+assert train_df["physician_id"].is_unique
+assert valid_df["physician_id"].is_unique
+assert test_df["physician_id"].is_unique
+
+# Do NOT use ID as a model feature.
+ID_COL = "physician_id"
+TARGET_COL = "adopted"
+
+# Add target only to labelled data for reference
+train_df[TARGET_COL] = y_train
+valid_df[TARGET_COL] = y_valid
+
+# -----------------------------
+# 13. Final model feature selection
+# -----------------------------
+EXCLUDE = {
+    ID_COL, TARGET_COL,
+    # Target leakage:
+    # rx_count never entered feature engineering, but exclude if present.
+    "rx_count"
+}
+
+feature_columns = [
+    c for c in train_df.columns
+    if c not in EXCLUDE
+]
+
+# Drop correlation-reduced numeric features
+feature_columns = [c for c in feature_columns if c not in corr_drop]
+
+# Remove any all-null / constant columns based on TRAIN ONLY
+safe_feature_columns = []
+for c in feature_columns:
+    if train_df[c].nunique(dropna=True) > 1:
+        safe_feature_columns.append(c)
+
+feature_columns = safe_feature_columns
+
+X_train = train_df[feature_columns].copy()
+X_valid = valid_df[feature_columns].copy()
+X_test = test_df[feature_columns].copy()
+
+numeric_features = X_train.select_dtypes(include=[np.number]).columns.tolist()
+categorical_features = [
+    c for c in feature_columns if c not in numeric_features
+]
+
+print("\nMODEL FEATURES")
+print("Total:", len(feature_columns))
+print("Numeric:", len(numeric_features))
+print("Categorical:", len(categorical_features))
+
+# -----------------------------
+# 14. Preprocessing
+# -----------------------------
+numeric_pipe = Pipeline([
+    ("imputer", SimpleImputer(strategy="median")),
+    ("scaler", StandardScaler())
+])
+
+categorical_pipe = Pipeline([
+    ("imputer", SimpleImputer(strategy="most_frequent")),
+    ("onehot", OneHotEncoder(handle_unknown="ignore"))
+])
+
+preprocessor = ColumnTransformer([
+    ("num", numeric_pipe, numeric_features),
+    ("cat", categorical_pipe, categorical_features)
+])
+
+# -----------------------------
+# 15. Model factory
+# -----------------------------
+def make_model(model_name, params=None):
+    params = params or {}
+
+    if model_name == "Logistic Regression":
+        return LogisticRegression(
+            C=params.get("C", 1.0),
+            max_iter=3000,
+            class_weight=params.get("class_weight", "balanced"),
+            random_state=SEED
+        )
+
+    if model_name == "Random Forest":
+        return RandomForestClassifier(
+            n_estimators=params.get("n_estimators", 500),
+            max_depth=params.get("max_depth", None),
+            min_samples_leaf=params.get("min_samples_leaf", 2),
+            max_features=params.get("max_features", "sqrt"),
+            class_weight=params.get("class_weight", "balanced_subsample"),
+            oob_score=True,
+            bootstrap=True,
+            n_jobs=-1,
+            random_state=SEED
+        )
+
+    if model_name == "XGBoost":
+        if not XGB_AVAILABLE:
+            raise ImportError(
+                "xgboost is not installed. Install it with: pip install xgboost"
+            )
+        # scale_pos_weight is calculated from TRAIN only when params do not
+        # explicitly supply it.
+        neg = max(int((y_train == 0).sum()), 1)
+        pos = max(int((y_train == 1).sum()), 1)
+        spw = neg / pos
+
+        return XGBClassifier(
+            n_estimators=params.get("n_estimators", 400),
+            max_depth=params.get("max_depth", 5),
+            learning_rate=params.get("learning_rate", 0.05),
+            subsample=params.get("subsample", 0.85),
+            colsample_bytree=params.get("colsample_bytree", 0.85),
+            min_child_weight=params.get("min_child_weight", 2),
+            gamma=params.get("gamma", 0.0),
+            reg_alpha=params.get("reg_alpha", 0.0),
+            reg_lambda=params.get("reg_lambda", 1.0),
+            objective="binary:logistic",
+            eval_metric="logloss",
+            scale_pos_weight=params.get("scale_pos_weight", spw),
+            random_state=SEED,
+            n_jobs=-1
+        )
+
+    if model_name == "Gradient Boosting":
+        return GradientBoostingClassifier(
+            n_estimators=params.get("n_estimators", 250),
+            max_depth=params.get("max_depth", 3),
+            learning_rate=params.get("learning_rate", 0.05),
+            random_state=SEED
+        )
+
+    raise ValueError(f"Unknown model: {model_name}")
+
+def build_pipeline(model_name, params=None):
+    model = make_model(model_name, params)
+
+    steps = [("preprocessor", preprocessor)]
+
+    # SMOTETomek must be applied only to the training fold. ImbPipeline
+    # guarantees this during CV.
+    if IMBLEARN_AVAILABLE and model_name in {
+        "Logistic Regression", "Random Forest", "XGBoost"
+    }:
+        steps.append((
+            "smotetomek",
+            SMOTETomek(random_state=SEED)
+        ))
+
+    steps.append(("model", model))
+
+    if IMBLEARN_AVAILABLE and model_name in {
+        "Logistic Regression", "Random Forest", "XGBoost"
+    }:
+        return ImbPipeline(steps)
+    return Pipeline(steps)
+
+# -----------------------------
+# 16. 5-fold CV
+# -----------------------------
+cv = StratifiedKFold(
+    n_splits=5,
+    shuffle=True,
+    random_state=SEED
+)
+
+models = {
+    "Logistic Regression": {},
+    "Random Forest": {},
+}
+
+if XGB_AVAILABLE:
+    models["XGBoost"] = {}
+else:
+    print("\nXGBoost is not installed; Gradient Boosting will still run.")
+
+models["Gradient Boosting"] = {}
+
+cv_rows = []
+
+print("\n================ 5-FOLD CV ================")
+
+for model_name, params in models.items():
+    pipe = build_pipeline(model_name, params)
+
+    try:
+        auc_scores = cross_val_score(
+            pipe, X_train, y_train,
+            cv=cv,
+            scoring="roc_auc",
+            n_jobs=1
+        )
+        pr_scores = cross_val_score(
+            pipe, X_train, y_train,
+            cv=cv,
+            scoring="average_precision",
+            n_jobs=1
+        )
+
+        print(
+            f"{model_name}: "
+            f"ROC-AUC={auc_scores.mean():.4f} ± {auc_scores.std():.4f}, "
+            f"PR-AUC={pr_scores.mean():.4f} ± {pr_scores.std():.4f}"
+        )
+
+        cv_rows.append({
+            "model": model_name,
+            "cv_roc_auc_mean": auc_scores.mean(),
+            "cv_roc_auc_std": auc_scores.std(),
+            "cv_pr_auc_mean": pr_scores.mean(),
+            "cv_pr_auc_std": pr_scores.std()
+        })
+    except Exception as e:
+        print(f"{model_name} CV failed safely: {repr(e)}")
+        cv_rows.append({
+            "model": model_name,
+            "cv_roc_auc_mean": np.nan,
+            "cv_roc_auc_std": np.nan,
+            "cv_pr_auc_mean": np.nan,
+            "cv_pr_auc_std": np.nan
+        })
+
+pd.DataFrame(cv_rows).to_csv(OUTPUT_DIR / "cv_results.csv", index=False)
+
+# -----------------------------
+# 17. Fit every model on TRAIN and evaluate VALIDATION
+# -----------------------------
+def calculate_metrics(y_true, prob, threshold=0.5):
+    pred = (prob >= threshold).astype(int)
+
+    tn, fp, fn, tp = confusion_matrix(
+        y_true, pred, labels=[0, 1]
+    ).ravel()
+
+    specificity = tn / (tn + fp) if (tn + fp) else 0.0
+
+    metrics = {
+        "accuracy": accuracy_score(y_true, pred),
+        "balanced_accuracy": balanced_accuracy_score(y_true, pred),
+        "precision": precision_score(y_true, pred, zero_division=0),
+        "recall": recall_score(y_true, pred, zero_division=0),
+        "specificity": specificity,
+        "f1": f1_score(y_true, pred, zero_division=0),
+        "roc_auc": roc_auc_score(y_true, prob),
+        "pr_auc": average_precision_score(y_true, prob),
+        "log_loss": log_loss(y_true, np.clip(prob, 1e-7, 1 - 1e-7)),
+        "mcc": matthews_corrcoef(y_true, pred),
+        "tn": tn, "fp": fp, "fn": fn, "tp": tp
+    }
+    return metrics
+
+fitted_models = {}
+validation_predictions = {}
+performance_rows = []
+
+for model_name, params in models.items():
+    print(f"\n================ {model_name} ================")
+
+    try:
+        pipe = build_pipeline(model_name, params)
+        pipe.fit(X_train, y_train)
+
+        prob = pipe.predict_proba(X_valid)[:, 1]
+        pred = (prob >= 0.5).astype(int)
+
+        metrics = calculate_metrics(y_valid, prob, threshold=0.5)
+        metrics["model"] = model_name
+
+        fitted_models[model_name] = pipe
+        validation_predictions[model_name] = prob
+        performance_rows.append(metrics)
+
+        print(pd.Series(metrics).drop(labels=["model"]).to_string())
+        print("\nClassification report:")
+        print(classification_report(
+            y_valid, pred,
+            target_names=["Non-adopter", "Adopter"],
+            zero_division=0
+        ))
+
+        # RF OOB score
+        if model_name == "Random Forest":
+            try:
+                rf_est = pipe.named_steps["model"]
+                print("Random Forest OOB score:",
+                      getattr(rf_est, "oob_score_", np.nan))
+            except Exception:
+                pass
+
+    except Exception as e:
+        print(f"{model_name} failed: {repr(e)}")
+
+performance = pd.DataFrame(performance_rows)
+
+if performance.empty:
+    raise RuntimeError("All models failed. Check package versions/data.")
+
+# Sort by ROC-AUC first, then PR-AUC, then F1.
+performance = performance.sort_values(
+    ["roc_auc", "pr_auc", "f1"],
+    ascending=False
+).reset_index(drop=True)
+
+print("\n================ VALIDATION MODEL COMPARISON ================")
+print(performance.to_string(index=False))
+performance.to_csv(OUTPUT_DIR / "model_comparison.csv", index=False)
+
+# -----------------------------
+# 18. ROC-AUC comparison curve
+# -----------------------------
+plt.figure(figsize=(8, 6))
+for model_name, prob in validation_predictions.items():
+    fpr, tpr, _ = roc_curve(y_valid, prob)
+    auc = roc_auc_score(y_valid, prob)
+    plt.plot(fpr, tpr, label=f"{model_name} (AUC={auc:.3f})")
+
+plt.plot([0, 1], [0, 1], linestyle="--", label="Random")
+plt.xlabel("False Positive Rate")
+plt.ylabel("True Positive Rate")
+plt.title("Validation ROC-AUC Comparison")
+plt.legend()
+plt.tight_layout()
+plt.savefig(PLOT_DIR / "roc_auc_comparison.png", dpi=160)
+plt.close()
+
+# -----------------------------
+# 19. PR-AUC comparison curve
+# -----------------------------
+plt.figure(figsize=(8, 6))
+baseline = y_valid.mean()
+
+for model_name, prob in validation_predictions.items():
+    precision, recall, _ = precision_recall_curve(y_valid, prob)
+    ap = average_precision_score(y_valid, prob)
+    plt.plot(recall, precision, label=f"{model_name} (PR-AUC={ap:.3f})")
+
+plt.axhline(
+    baseline, linestyle="--",
+    label=f"Positive prevalence={baseline:.3f}"
+)
+plt.xlabel("Recall")
+plt.ylabel("Precision")
+plt.title("Validation Precision-Recall / PR-AUC Comparison")
+plt.legend()
+plt.tight_layout()
+plt.savefig(PLOT_DIR / "pr_auc_comparison.png", dpi=160)
+plt.close()
+
+# -----------------------------
+# 20. Threshold analysis
+# -----------------------------
+# Problem statement says 0.5 is acceptable. We retain 0.5 as the official
+# prediction threshold, but report the best-F1 threshold as an analysis.
+best_model_name = performance.iloc[0]["model"]
+best_prob = validation_predictions[best_model_name]
+
+threshold_rows = []
+for threshold in np.arange(0.10, 0.91, 0.01):
+    p = (best_prob >= threshold).astype(int)
+    threshold_rows.append({
+        "threshold": threshold,
+        "precision": precision_score(y_valid, p, zero_division=0),
+        "recall": recall_score(y_valid, p, zero_division=0),
+        "f1": f1_score(y_valid, p, zero_division=0),
+        "accuracy": accuracy_score(y_valid, p)
+    })
+
+threshold_df = pd.DataFrame(threshold_rows)
+threshold_df.to_csv(OUTPUT_DIR / "threshold_analysis.csv", index=False)
+
+best_f1_row = threshold_df.loc[threshold_df["f1"].idxmax()]
+print("\nBest validation F1 threshold (analysis only):")
+print(best_f1_row.to_dict())
+print("Official final binary threshold remains 0.50.")
+
+# -----------------------------
+# 21. Logistic regression interpretation
+# -----------------------------
+if "Logistic Regression" in fitted_models:
+    try:
+        lr_pipe = fitted_models["Logistic Regression"]
+        pre = lr_pipe.named_steps["preprocessor"]
+        lr = lr_pipe.named_steps["model"]
+
+        feature_names = pre.get_feature_names_out()
+        coefs = lr.coef_[0]
+
+        coef_df = pd.DataFrame({
+            "encoded_feature": feature_names,
+            "coefficient": coefs,
+            "odds_ratio": np.exp(np.clip(coefs, -20, 20)),
+            "abs_coefficient": np.abs(coefs)
+        }).sort_values("abs_coefficient", ascending=False)
+
+        coef_df.to_csv(OUTPUT_DIR / "logistic_coefficients.csv", index=False)
+
+        print("\nTop logistic regression coefficients:")
+        print(coef_df.head(20).to_string(index=False))
+    except Exception as e:
+        print("Logistic coefficient extraction skipped safely:", repr(e))
+
+# -----------------------------
+# 22. Feature importance
+# -----------------------------
+# Native tree importances after preprocessing.
+importance_tables = []
+
+for model_name in ["Random Forest", "XGBoost", "Gradient Boosting"]:
+    if model_name not in fitted_models:
+        continue
+
+    try:
+        pipe = fitted_models[model_name]
+        pre = pipe.named_steps["preprocessor"]
+        est = pipe.named_steps["model"]
+        names = pre.get_feature_names_out()
+
+        if hasattr(est, "feature_importances_"):
+            imp = est.feature_importances_
+            tmp = pd.DataFrame({
+                "model": model_name,
+                "encoded_feature": names,
+                "importance": imp
+            }).sort_values("importance", ascending=False)
+            importance_tables.append(tmp)
+    except Exception as e:
+        print(f"{model_name} feature importance skipped:", repr(e))
+
+if importance_tables:
+    fi_all = pd.concat(importance_tables, ignore_index=True)
+    fi_all.to_csv(OUTPUT_DIR / "feature_importance.csv", index=False)
+
+    for model_name in fi_all["model"].unique():
+        top = fi_all[fi_all["model"] == model_name].head(15)
+        plt.figure(figsize=(9, 6))
+        plt.barh(
+            top["encoded_feature"][::-1],
+            top["importance"][::-1]
+        )
+        plt.title(f"Top Feature Importances - {model_name}")
+        plt.xlabel("Importance")
+        plt.tight_layout()
+        safe_name = re.sub(r"[^A-Za-z0-9]+", "_", model_name).strip("_").lower()
+        plt.savefig(PLOT_DIR / f"feature_importance_{safe_name}.png", dpi=160)
+        plt.close()
+
+# -----------------------------
+# 23. Permutation importance for best model
+# -----------------------------
+# This is performed on the held-out validation set, so it is a genuine
+# validation-set interpretability analysis.
+try:
+    best_pipe = fitted_models[best_model_name]
+
+    perm = permutation_importance(
+        best_pipe,
+        X_valid,
+        y_valid,
+        scoring="roc_auc",
+        n_repeats=5,
+        random_state=SEED,
+        n_jobs=1
+    )
+
+    perm_df = pd.DataFrame({
+        "feature": X_valid.columns,
+        "importance_mean": perm.importances_mean,
+        "importance_std": perm.importances_std
+    }).sort_values("importance_mean", ascending=False)
+
+    perm_df.to_csv(OUTPUT_DIR / "permutation_importance_validation.csv", index=False)
+
+    top_perm = perm_df.head(15)
+    plt.figure(figsize=(9, 6))
+    plt.barh(
+        top_perm["feature"][::-1],
+        top_perm["importance_mean"][::-1]
+    )
+    plt.title(f"Validation Permutation Importance - {best_model_name}")
+    plt.xlabel("Mean decrease in ROC-AUC")
+    plt.tight_layout()
+    plt.savefig(PLOT_DIR / "permutation_importance_validation.png", dpi=160)
+    plt.close()
+
+    print("\nTop adoption drivers from validation permutation importance:")
+    print(top_perm.to_string(index=False))
+except Exception as e:
+    print("Permutation importance skipped safely:", repr(e))
+
+# -----------------------------
+# 24. Mixed-effects / territory model
+# -----------------------------
+# statsmodels MixedLM is Gaussian and is NOT a true binary logistic mixed model.
+# Where available, BayesianBinomialMixedGLM is used. If the installed
+# statsmodels version cannot fit it, the code falls back to a territory
+# fixed-effect logistic model rather than crashing.
+#
+# This section is an additional requested territory-level analysis and does
+# NOT determine the final tree-model winner.
+mixed_result_text = []
+
+if STATSMODELS_AVAILABLE and "territory_code" in train_df.columns:
+    try:
+        # Physician-level static/numeric model table.
+        mixed_cols = [
+            c for c in [
+                "rep_calls_total", "samples_provided_total",
+                "digital_engagements_total", "peer_network_score_recent3_mean",
+                "payer_access_score", "hcp_decile", "years_in_practice",
+                "territory_code"
+            ] if c in train_df.columns
+        ]
+
+        mixed_df = train_df[mixed_cols + ["adopted"]].copy()
+
+        # BayesianBinomialMixedGLM requires a categorical random effect.
+        # Keep only rows with complete required fields.
+        if hasattr(sm, "genmod") and hasattr(sm.genmod.bayes_mixed_glm, "BinomialBayesMixedGLM"):
+            formula_parts = [
+                c for c in mixed_cols
+                if c != "territory_code"
+                and pd.api.types.is_numeric_dtype(mixed_df[c])
+            ]
+
+            mixed_df = mixed_df.dropna(subset=formula_parts + ["territory_code", "adopted"]).copy()
+
+            if len(formula_parts) >= 1 and mixed_df["territory_code"].nunique() >= 2:
+                rhs = " + ".join(formula_parts)
+                formula = f"adopted ~ {rhs}"
+                vc_formula = {"territory": "0 + C(territory_code)"}
+
+                mb = sm.genmod.bayes_mixed_glm.BinomialBayesMixedGLM.from_formula(
+                    formula, vc_formula, mixed_df
+                )
+                fit = mb.fit_vb()
+
+                mixed_result_text = [
+                    "TRUE BINOMIAL MIXED MODEL (BayesianBinomialMixedGLM) FIT SUCCESSFULLY",
+                    str(fit.summary())
+                ]
+                (OUTPUT_DIR / "mixed_effects_logistic_summary.txt").write_text(
+                    "\n".join(mixed_result_text),
+                    encoding="utf-8"
+                )
+                print("\nMixed-effects logistic model:")
+                print(fit.summary())
+            else:
+                print("\nMixed model skipped: insufficient complete training data.")
+        else:
+            print("\nBayesianBinomialMixedGLM unavailable in installed statsmodels.")
+    except Exception as e:
+        print("\nMixed-effects model could not be fit; pipeline continues safely.")
+        print("Reason:", repr(e))
+        (OUTPUT_DIR / "mixed_effects_logistic_summary.txt").write_text(
+            "Mixed-effects logistic model unavailable/failed safely.\n"
+            + repr(e),
+            encoding="utf-8"
+        )
+else:
+    print("\nStatsmodels or territory_code unavailable; mixed model skipped.")
+
+# -----------------------------
+# 25. Mutual information on TRAIN ONLY
+# -----------------------------
+# MI is an additional nonlinear association screen.
+try:
+    mi_num = [
+        c for c in numeric_features
+        if X_train[c].nunique(dropna=True) > 1
+    ]
+
+    if mi_num:
+        X_mi = X_train[mi_num].copy()
+        X_mi = X_mi.replace([np.inf, -np.inf], np.nan)
+        X_mi = X_mi.fillna(X_mi.median(numeric_only=True)).fillna(0)
+
+        mi_values = mutual_info_classif(
+            X_mi, y_train,
+            random_state=SEED
+        )
+
+        mi_df = pd.DataFrame({
+            "feature": mi_num,
+            "mutual_information": mi_values
+        }).sort_values("mutual_information", ascending=False)
+
+        mi_df.to_csv(OUTPUT_DIR / "mutual_information_train.csv", index=False)
+
+        print("\nTop MI features:")
+        print(mi_df.head(20).to_string(index=False))
+except Exception as e:
+    print("Mutual information skipped safely:", repr(e))
+
+# -----------------------------
+# 26. Final model selection
+# -----------------------------
+# Best model is selected ONLY from the labelled validation comparison.
+best_model_name = performance.iloc[0]["model"]
+print("\n================ FINAL MODEL ================")
+print("Selected model:", best_model_name)
+
+# -----------------------------
+# 27. Refit final model on ALL labelled physicians
+# -----------------------------
+# Rebuild the target-derived territory adoption feature using ALL labelled
+# physicians now that validation has served its model-selection purpose.
+#
+# IMPORTANT:
+# Test physicians are still excluded from this fit.
+#
+all_labelled_ids = set(labelled_ids)
+
+# Recreate territory features using all labelled physicians.
+features_final_territory = add_territory_features(
+    base_features, behavior, profile, all_labelled_ids
+)
+
+# Refit KMeans on all labelled physicians.
+final_train_ft = features_final_territory[
+    features_final_territory["physician_id"].isin(all_labelled_ids)
+].copy()
+
+features_final, final_kmeans, final_cluster_scaler = add_clusters(
+    final_train_ft,
+    features_final_territory,
+    n_clusters=5
+)
+
+final_train = features_final[
+    features_final["physician_id"].isin(all_labelled_ids)
+].copy()
+final_test = features_final[
+    features_final["physician_id"].isin(test_set)
+].copy()
+
+final_feature_columns = [
+    c for c in final_train.columns
+    if c not in {ID_COL, TARGET_COL, "rx_count"}
+    and c not in corr_drop
+]
+
+final_feature_columns = [
+    c for c in final_feature_columns
+    if final_train[c].nunique(dropna=True) > 1
+]
+
+X_all_train = final_train[final_feature_columns].copy()
+X_final_test = final_test[final_feature_columns].copy()
+y_all_train = adoption_label.reindex(final_train["physician_id"]).astype(int).values
+
+# Rebuild preprocessor for final full-training data.
+final_num_features = X_all_train.select_dtypes(include=[np.number]).columns.tolist()
+final_cat_features = [
+    c for c in final_feature_columns if c not in final_num_features
+]
+
+final_numeric_pipe = Pipeline([
+    ("imputer", SimpleImputer(strategy="median")),
+    ("scaler", StandardScaler())
+])
+
+final_categorical_pipe = Pipeline([
+    ("imputer", SimpleImputer(strategy="most_frequent")),
+    ("onehot", OneHotEncoder(handle_unknown="ignore"))
+])
+
+final_preprocessor = ColumnTransformer([
+    ("num", final_numeric_pipe, final_num_features),
+    ("cat", final_categorical_pipe, final_cat_features)
+])
+
+def build_final_pipeline(model_name):
+    model = make_model(model_name, {})
+
+    steps = [("preprocessor", final_preprocessor)]
+
+    if IMBLEARN_AVAILABLE and model_name in {
+        "Logistic Regression", "Random Forest", "XGBoost"
+    }:
+        steps.append(("smotetomek", SMOTETomek(random_state=SEED)))
+
+    steps.append(("model", model))
+
+    if IMBLEARN_AVAILABLE and model_name in {
+        "Logistic Regression", "Random Forest", "XGBoost"
+    }:
+        return ImbPipeline(steps)
+    return Pipeline(steps)
+
+final_model = build_final_pipeline(best_model_name)
+final_model.fit(X_all_train, y_all_train)
+
+# -----------------------------
+# 28. Q11 predictions for exactly the test physician set
+# -----------------------------
+test_probability = final_model.predict_proba(X_final_test)[:, 1]
+
+predictions = pd.DataFrame({
+    "physician_id": final_test["physician_id"].values,
+    "adoption_probability": np.clip(test_probability, 0, 1),
+    "adoption_prediction": (test_probability >= 0.50).astype(int)
+})
+
+# Add engineered features required by deliverable.
+engineered_output_features = final_test[
+    ["physician_id"] + [
+        c for c in final_feature_columns
+        if c in final_test.columns
+    ]
+].copy()
+
+predictions = predictions.merge(
+    engineered_output_features,
+    on="physician_id",
+    how="left",
+    validate="one_to_one"
+)
+
+predictions = predictions.sort_values(
+    "adoption_probability",
+    ascending=False
+).reset_index(drop=True)
+
+# Add rank
+predictions.insert(
+    1,
+    "adoption_rank",
+    np.arange(1, len(predictions) + 1)
+)
+
+# Sanity checks
+assert predictions["physician_id"].is_unique
+assert len(predictions) == len(test_set)
+assert set(predictions["physician_id"]) == test_set
+
+predictions.to_csv(OUTPUT_DIR / "predictions.csv", index=False)
+
+# Also save top 200
+predictions.head(200).to_csv(
+    OUTPUT_DIR / "top_200_q11_targets.csv",
+    index=False
+)
+
+print("\n================ FINAL PREDICTION CHECK ================")
+print("Prediction rows:", len(predictions))
+print("Unique physicians:", predictions["physician_id"].nunique())
+print("Expected test physicians:", len(test_set))
+print("Binary positives at threshold 0.50:",
+      int(predictions["adoption_prediction"].sum()))
+
+print("\nTop 20 Q11 targets:")
+print(
+    predictions[
+        ["adoption_rank", "physician_id",
+         "adoption_probability", "adoption_prediction"]
+    ].head(20).to_string(index=False)
+)
+
+# -----------------------------
+# 29. Probability distribution
+# -----------------------------
+plt.figure(figsize=(8, 5))
+plt.hist(predictions["adoption_probability"], bins=30)
+plt.xlabel("Predicted Q11 adoption probability")
+plt.ylabel("Physician count")
+plt.title("Q11 Adoption Probability Distribution - Test Physicians")
+plt.tight_layout()
+plt.savefig(PLOT_DIR / "q11_probability_distribution.png", dpi=160)
+plt.close()
+
+# -----------------------------
+# 30. Final driver summary
+# -----------------------------
+# If permutation importance exists, create a concise business-driver file.
+if (OUTPUT_DIR / "permutation_importance_validation.csv").exists():
+    driver_df = pd.read_csv(
+        OUTPUT_DIR / "permutation_importance_validation.csv"
+    ).head(20)
+    driver_df.to_csv(
+        OUTPUT_DIR / "top_adoption_drivers.csv",
+        index=False
+    )
+
+# -----------------------------
+# 31. Final audit report
+# -----------------------------
+audit = {
+    "total_source_physicians": int(physician_universe["physician_id"].nunique()),
+    "labelled_train_pool_before_holdout": int(len(labelled_ids)),
+    "train_physicians": int(len(train_ids)),
+    "validation_physicians": int(len(valid_ids)),
+    "test_physicians": int(len(test_set)),
+    "test_prediction_rows": int(len(predictions)),
+    "test_unique_physicians": int(predictions["physician_id"].nunique()),
+    "best_model": best_model_name,
+    "official_threshold": 0.50,
+    "xgboost_available": XGB_AVAILABLE,
+    "imblearn_available": IMBLEARN_AVAILABLE,
+    "statsmodels_available": STATSMODELS_AVAILABLE,
+    "feature_count": int(len(final_feature_columns))
+}
+
+pd.DataFrame([audit]).to_csv(
+    OUTPUT_DIR / "pipeline_audit.csv",
+    index=False
+)
+
+print("\n========================================================")
+print("PIPELINE COMPLETE")
+print("========================================================")
+print("Outputs saved in:", OUTPUT_DIR.resolve())
+print("Main prediction file:", (OUTPUT_DIR / "predictions.csv").resolve())
+print("Model comparison:", (OUTPUT_DIR / "model_comparison.csv").resolve())
+print("ROC curve:", (PLOT_DIR / "roc_auc_comparison.png").resolve())
+print("PR curve:", (PLOT_DIR / "pr_auc_comparison.png").resolve())
+print("Top 200:", (OUTPUT_DIR / "top_200_q11_targets.csv").resolve())
+print("========================================================")
+
+# ================================================================
+# END
+# ================================================================
