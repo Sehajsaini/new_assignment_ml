@@ -1,0 +1,1763 @@
+# =============================================================================
+# ABC PHARMACEUTICALS – Q11 PHYSICIAN ADOPTION PREDICTION
+# COMPLETE END-TO-END MACHINE LEARNING SOLUTION
+# =============================================================================
+
+# =============================================================================
+# 1. IMPORT LIBRARIES AND SETUP
+# =============================================================================
+
+import warnings
+warnings.filterwarnings("ignore")
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+import statsmodels.api as sm
+
+from statsmodels.stats.outliers_influence import variance_inflation_factor
+
+from sklearn.model_selection import (
+    train_test_split,
+    StratifiedKFold,
+    GridSearchCV
+)
+
+from sklearn.preprocessing import (
+    StandardScaler,
+    OneHotEncoder
+)
+
+from sklearn.compose import ColumnTransformer
+
+from sklearn.pipeline import Pipeline
+
+from sklearn.impute import SimpleImputer
+
+from sklearn.linear_model import LogisticRegression
+
+from sklearn.ensemble import (
+    RandomForestClassifier,
+    GradientBoostingClassifier
+)
+
+from sklearn.cluster import KMeans
+
+from sklearn.metrics import (
+    roc_auc_score,
+    f1_score,
+    precision_score,
+    recall_score,
+    classification_report,
+    roc_curve
+)
+
+from sklearn.inspection import permutation_importance
+
+from xgboost import XGBClassifier
+
+
+RANDOM_STATE = 42
+np.random.seed(RANDOM_STATE)
+
+pd.set_option("display.max_columns", 100)
+
+
+# =============================================================================
+# 2. LOAD DATA
+# =============================================================================
+
+file1 = pd.read_csv("input_data_file1.csv")
+file2 = pd.read_csv("input_data_file2.csv")
+test_physicians = pd.read_csv("test_physicians.csv")
+
+print("=" * 70)
+print("DATASET SHAPES")
+print("=" * 70)
+
+print("Longitudinal Data:", file1.shape)
+print("Static Physician Data:", file2.shape)
+print("Test Physicians:", test_physicians.shape)
+
+print("\nLONGITUDINAL DATA SAMPLE")
+display(file1.head())
+
+print("\nSTATIC DATA SAMPLE")
+display(file2.head())
+
+print("\nTEST DATA SAMPLE")
+display(test_physicians.head())
+
+
+# =============================================================================
+# 3. DATA QUALITY CHECKS AND EDA
+# =============================================================================
+
+print("=" * 70)
+print("MISSING VALUES")
+print("=" * 70)
+
+print("\nFile 1:")
+display(file1.isnull().sum()[file1.isnull().sum() > 0])
+
+print("\nFile 2:")
+display(file2.isnull().sum()[file2.isnull().sum() > 0])
+
+print("\nDuplicate rows in File 1:", file1.duplicated().sum())
+print("Duplicate rows in File 2:", file2.duplicated().sum())
+
+print("\nUnique physicians in File 1:",
+      file1["physician_id"].nunique())
+
+print("Unique physicians in File 2:",
+      file2["physician_id"].nunique())
+
+
+# =============================================================================
+# 4. CREATE PHYSICIAN-LEVEL ADOPTION TARGET
+# =============================================================================
+# A physician is considered adopted if they prescribed Drug XYZ in at least
+# one of the historical quarters Q1-Q10.
+# =============================================================================
+
+adoption_target = (
+    file1.groupby("physician_id")["rx_count"]
+    .max()
+    .gt(0)
+    .astype(int)
+    .reset_index(name="adopted")
+)
+
+print("\n" + "=" * 70)
+print("CLASS BALANCE")
+print("=" * 70)
+
+display(adoption_target["adopted"].value_counts())
+
+print(
+    "\nOverall historical adoption rate:",
+    round(adoption_target["adopted"].mean(), 4)
+)
+
+plt.figure(figsize=(6, 4))
+
+adoption_target["adopted"].value_counts().sort_index().plot(
+    kind="bar"
+)
+
+plt.xticks([0, 1], ["Non-Adopter", "Adopter"], rotation=0)
+plt.title("Historical Adoption Class Distribution")
+plt.ylabel("Number of Physicians")
+plt.show()
+
+
+# =============================================================================
+# 5. EDA – ADOPTION BY SPECIALTY AND REGION
+# =============================================================================
+
+eda_data = file2.merge(
+    adoption_target,
+    on="physician_id",
+    how="left"
+)
+
+specialty_adoption = (
+    eda_data.groupby("specialty")["adopted"]
+    .agg(["mean", "count"])
+    .sort_values("mean", ascending=False)
+)
+
+print("\nADOPTION RATE BY SPECIALTY")
+display(specialty_adoption)
+
+region_adoption = (
+    eda_data.groupby("geographic_region")["adopted"]
+    .agg(["mean", "count"])
+    .sort_values("mean", ascending=False)
+)
+
+print("\nADOPTION RATE BY REGION")
+display(region_adoption)
+
+
+# =============================================================================
+# 6. OUTLIER DETECTION USING IQR
+# =============================================================================
+
+numeric_longitudinal_columns = [
+    "rx_count",
+    "rep_calls",
+    "samples_provided",
+    "digital_engagements",
+    "competitive_rx_count",
+    "peer_network_score",
+    "medical_education_events"
+]
+
+outlier_results = []
+
+for column in numeric_longitudinal_columns:
+
+    q1 = file1[column].quantile(0.25)
+    q3 = file1[column].quantile(0.75)
+
+    iqr = q3 - q1
+
+    lower_bound = q1 - 1.5 * iqr
+    upper_bound = q3 + 1.5 * iqr
+
+    outliers = (
+        (file1[column] < lower_bound)
+        | (file1[column] > upper_bound)
+    ).sum()
+
+    outlier_results.append(
+        {
+            "feature": column,
+            "outlier_count": outliers,
+            "outlier_percentage":
+                round(outliers / len(file1) * 100, 2)
+        }
+    )
+
+outlier_summary = pd.DataFrame(outlier_results)
+
+print("\nOUTLIER SUMMARY")
+display(outlier_summary)
+
+
+# =============================================================================
+# 7. OLS REGRESSION FOR EXPLORATORY ASSOCIATION ANALYSIS
+# =============================================================================
+# OLS is used only to understand linear associations as requested.
+# Logistic Regression will be used for the actual classification model.
+# =============================================================================
+
+ols_data = (
+    file1.groupby("physician_id")[
+        [
+            "rep_calls",
+            "samples_provided",
+            "digital_engagements"
+        ]
+    ]
+    .mean()
+    .reset_index()
+    .merge(
+        adoption_target,
+        on="physician_id",
+        how="inner"
+    )
+)
+
+X_ols = ols_data[
+    [
+        "rep_calls",
+        "samples_provided",
+        "digital_engagements"
+    ]
+]
+
+X_ols_with_constant = sm.add_constant(X_ols)
+
+y_ols = ols_data["adopted"]
+
+ols_model = sm.OLS(
+    y_ols,
+    X_ols_with_constant
+).fit()
+
+print("\n" + "=" * 70)
+print("OLS REGRESSION RESULTS")
+print("=" * 70)
+
+print(ols_model.summary())
+
+
+# =============================================================================
+# 8. VIF CHECK FOR RAW NUMERIC FEATURES
+# =============================================================================
+
+vif_data = pd.DataFrame()
+
+vif_data["feature"] = X_ols.columns
+
+vif_data["VIF"] = [
+    variance_inflation_factor(
+        X_ols.values,
+        i
+    )
+    for i in range(X_ols.shape[1])
+]
+
+print("\nVIF RESULTS")
+display(
+    vif_data.sort_values(
+        "VIF",
+        ascending=False
+    )
+)
+
+
+# =============================================================================
+# 9. FEATURE ENGINEERING HELPER FUNCTIONS
+# =============================================================================
+
+def get_quarter_number(quarter):
+    """Convert Q1, Q2, ..., Q10 into integers."""
+    return int(quarter.replace("Q", ""))
+
+
+def monotonic_increasing(values):
+    """Check whether values are monotonically increasing."""
+    values = list(values)
+
+    return int(
+        all(
+            values[i] <= values[i + 1]
+            for i in range(len(values) - 1)
+        )
+    )
+
+
+def calculate_slope(values):
+    """Calculate the linear trend slope."""
+    values = np.asarray(values)
+
+    if len(values) < 2:
+        return 0
+
+    x = np.arange(len(values))
+
+    return np.polyfit(
+        x,
+        values,
+        1
+    )[0]
+
+
+# =============================================================================
+# 10. MAIN FEATURE ENGINEERING FUNCTION
+# =============================================================================
+
+def create_physician_features(long_data, static_data):
+
+    data = long_data.copy()
+
+    data["quarter_num"] = data["quarter"].apply(
+        get_quarter_number
+    )
+
+    data = data.sort_values(
+        ["physician_id", "quarter_num"]
+    )
+
+    feature_df = pd.DataFrame(
+        {
+            "physician_id":
+                data["physician_id"].unique()
+        }
+    )
+
+    # =========================================================================
+    # A. TOTAL AND AVERAGE BEHAVIOURAL FEATURES
+    # =========================================================================
+
+    activity_columns = [
+        "rep_calls",
+        "samples_provided",
+        "digital_engagements",
+        "competitive_rx_count",
+        "medical_education_events"
+    ]
+
+    totals = (
+        data.groupby("physician_id")[activity_columns]
+        .sum()
+        .add_prefix("total_")
+        .reset_index()
+    )
+
+    means = (
+        data.groupby("physician_id")[activity_columns]
+        .mean()
+        .add_prefix("mean_")
+        .reset_index()
+    )
+
+    feature_df = feature_df.merge(
+        totals,
+        on="physician_id",
+        how="left"
+    )
+
+    feature_df = feature_df.merge(
+        means,
+        on="physician_id",
+        how="left"
+    )
+
+    # =========================================================================
+    # B. RECENCY FEATURES – Q8 TO Q10
+    # =========================================================================
+
+    recent_data = data[
+        data["quarter_num"].between(8, 10)
+    ]
+
+    recent_means = (
+        recent_data.groupby("physician_id")[activity_columns]
+        .mean()
+        .add_prefix("recent_mean_")
+        .reset_index()
+    )
+
+    feature_df = feature_df.merge(
+        recent_means,
+        on="physician_id",
+        how="left"
+    )
+
+    # =========================================================================
+    # C. EARLY PERIOD FEATURES – Q1 TO Q3
+    # =========================================================================
+
+    early_data = data[
+        data["quarter_num"].between(1, 3)
+    ]
+
+    early_means = (
+        early_data.groupby("physician_id")[activity_columns]
+        .mean()
+        .add_prefix("early_mean_")
+        .reset_index()
+    )
+
+    feature_df = feature_df.merge(
+        early_means,
+        on="physician_id",
+        how="left"
+    )
+
+    # =========================================================================
+    # D. RECENCY VS EARLY MOMENTUM
+    # =========================================================================
+
+    for column in activity_columns:
+
+        feature_df[f"{column}_trend"] = (
+            feature_df[f"recent_mean_{column}"]
+            - feature_df[f"early_mean_{column}"]
+        )
+
+        feature_df[f"{column}_recent_ratio"] = (
+            feature_df[f"recent_mean_{column}"]
+            / (
+                feature_df[f"mean_{column}"] + 1
+            )
+        )
+
+    # =========================================================================
+    # E. Q10 – MOST RECENT QUARTER FEATURES
+    # =========================================================================
+
+    q10_data = data[
+        data["quarter_num"] == 10
+    ]
+
+    q10_features = (
+        q10_data[
+            [
+                "physician_id",
+                "rep_calls",
+                "samples_provided",
+                "digital_engagements",
+                "competitive_rx_count"
+            ]
+        ]
+        .rename(
+            columns={
+                "rep_calls":
+                    "q10_rep_calls",
+
+                "samples_provided":
+                    "q10_samples",
+
+                "digital_engagements":
+                    "q10_digital",
+
+                "competitive_rx_count":
+                    "q10_competitive_rx"
+            }
+        )
+    )
+
+    feature_df = feature_df.merge(
+        q10_features,
+        on="physician_id",
+        how="left"
+    )
+
+    # =========================================================================
+    # F. EVENT AND EDUCATIONAL ENGAGEMENT
+    # =========================================================================
+
+    event_features = (
+        data.groupby("physician_id")
+        .agg(
+            total_speaker_programs=(
+                "speaker_program_attendance",
+                "sum"
+            ),
+
+            total_congress_attendance=(
+                "congress_attendance",
+                "sum"
+            ),
+
+            recent_speaker_programs=(
+                "speaker_program_attendance",
+                lambda x: x.iloc[-3:].sum()
+            ),
+
+            recent_congress_attendance=(
+                "congress_attendance",
+                lambda x: x.iloc[-3:].sum()
+            )
+        )
+        .reset_index()
+    )
+
+    feature_df = feature_df.merge(
+        event_features,
+        on="physician_id",
+        how="left"
+    )
+
+    # =========================================================================
+    # G. PEER NETWORK FEATURES
+    # =========================================================================
+
+    peer_features = (
+        data.groupby("physician_id")
+        .agg(
+            mean_peer_network_score=(
+                "peer_network_score",
+                "mean"
+            ),
+
+            recent_peer_network_score=(
+                "peer_network_score",
+                lambda x: x.iloc[-3:].mean()
+            )
+        )
+        .reset_index()
+    )
+
+    peer_features["peer_network_trend"] = (
+        peer_features["recent_peer_network_score"]
+        - peer_features["mean_peer_network_score"]
+    )
+
+    feature_df = feature_df.merge(
+        peer_features,
+        on="physician_id",
+        how="left"
+    )
+
+    # =========================================================================
+    # H. MOMENTUM AND SLOPE FEATURES
+    # =========================================================================
+
+    momentum_features = []
+
+    for physician_id, group in data.groupby("physician_id"):
+
+        group = group.sort_values("quarter_num")
+
+        last_four = group.tail(4)
+
+        momentum_features.append(
+            {
+                "physician_id": physician_id,
+
+                "rep_calls_increasing_4q":
+                    monotonic_increasing(
+                        last_four["rep_calls"].values
+                    ),
+
+                "digital_increasing_4q":
+                    monotonic_increasing(
+                        last_four["digital_engagements"].values
+                    ),
+
+                "samples_increasing_4q":
+                    monotonic_increasing(
+                        last_four["samples_provided"].values
+                    ),
+
+                "rep_calls_slope":
+                    calculate_slope(
+                        group["rep_calls"].values
+                    ),
+
+                "digital_slope":
+                    calculate_slope(
+                        group["digital_engagements"].values
+                    ),
+
+                "samples_slope":
+                    calculate_slope(
+                        group["samples_provided"].values
+                    ),
+
+                "competitive_rx_slope":
+                    calculate_slope(
+                        group[
+                            "competitive_rx_count"
+                        ].values
+                    )
+            }
+        )
+
+    momentum_features = pd.DataFrame(
+        momentum_features
+    )
+
+    feature_df = feature_df.merge(
+        momentum_features,
+        on="physician_id",
+        how="left"
+    )
+
+    # =========================================================================
+    # I. BUSINESS-FOCUSED CHANNEL INTERACTION FEATURES
+    # =========================================================================
+
+    feature_df["digital_to_calls_ratio"] = (
+        feature_df["total_digital_engagements"]
+        / (
+            feature_df["total_rep_calls"] + 1
+        )
+    )
+
+    feature_df["samples_per_call"] = (
+        feature_df["total_samples_provided"]
+        / (
+            feature_df["total_rep_calls"] + 1
+        )
+    )
+
+    feature_df["recent_push_score"] = (
+        feature_df["rep_calls_trend"]
+        + feature_df["samples_provided_trend"]
+        + feature_df["digital_engagements_trend"]
+    )
+
+    feature_df["recent_engagement_score"] = (
+        feature_df["recent_mean_rep_calls"]
+        + feature_df[
+            "recent_mean_digital_engagements"
+        ]
+        + feature_df[
+            "recent_mean_samples_provided"
+        ]
+    )
+
+    # =========================================================================
+    # J. MERGE STATIC PHYSICIAN FEATURES
+    # =========================================================================
+
+    feature_df = feature_df.merge(
+        static_data,
+        on="physician_id",
+        how="left"
+    )
+
+    return feature_df
+
+
+# =============================================================================
+# 11. CREATE PHYSICIAN-LEVEL MODEL DATA
+# =============================================================================
+
+physician_features = create_physician_features(
+    file1,
+    file2
+)
+
+model_data = physician_features.merge(
+    adoption_target,
+    on="physician_id",
+    how="left"
+)
+
+print("\nMODEL DATA SHAPE:", model_data.shape)
+display(model_data.head())
+
+
+# =============================================================================
+# 12. TERRITORY-LEVEL FEATURES
+# =============================================================================
+# Territory-level averages capture differences in sales activity and
+# engagement environments without directly using individual target values.
+# =============================================================================
+
+territory_features = (
+    model_data.groupby("territory_code")
+    .agg(
+        territory_avg_calls=(
+            "total_rep_calls",
+            "mean"
+        ),
+
+        territory_avg_samples=(
+            "total_samples_provided",
+            "mean"
+        ),
+
+        territory_avg_digital=(
+            "total_digital_engagements",
+            "mean"
+        ),
+
+        territory_avg_recent_push=(
+            "recent_push_score",
+            "mean"
+        )
+    )
+    .reset_index()
+)
+
+model_data = model_data.merge(
+    territory_features,
+    on="territory_code",
+    how="left"
+)
+
+
+# =============================================================================
+# 13. TERRITORY ADOPTION RATE EXPLORATION
+# =============================================================================
+
+territory_adoption = (
+    model_data.groupby("territory_code")["adopted"]
+    .agg(["mean", "count"])
+    .rename(
+        columns={
+            "mean": "adoption_rate",
+            "count": "physician_count"
+        }
+    )
+    .sort_values(
+        "adoption_rate",
+        ascending=False
+    )
+)
+
+print("\nTERRITORY ADOPTION RATE SUMMARY")
+display(territory_adoption.head(10))
+
+print(
+    "\nStandard deviation of territory adoption rates:",
+    round(
+        territory_adoption[
+            "adoption_rate"
+        ].std(),
+        4
+    )
+)
+
+
+# =============================================================================
+# 14. PHYSICIAN BEHAVIOURAL CLUSTERING
+# =============================================================================
+
+clustering_columns = [
+    "total_rep_calls",
+    "total_samples_provided",
+    "total_digital_engagements",
+    "recent_mean_rep_calls",
+    "recent_mean_digital_engagements",
+    "rep_calls_trend",
+    "digital_engagements_trend",
+    "recent_speaker_programs",
+    "mean_peer_network_score",
+    "competitive_rx_slope"
+]
+
+cluster_data = model_data[
+    clustering_columns
+].copy()
+
+cluster_medians = cluster_data.median()
+
+cluster_data = cluster_data.fillna(
+    cluster_medians
+)
+
+cluster_scaler = StandardScaler()
+
+cluster_scaled = cluster_scaler.fit_transform(
+    cluster_data
+)
+
+# Five behavioural segments
+kmeans = KMeans(
+    n_clusters=5,
+    random_state=RANDOM_STATE,
+    n_init=10
+)
+
+model_data["behavior_cluster"] = (
+    kmeans.fit_predict(cluster_scaled)
+)
+
+print("\nPHYSICIAN CLUSTER DISTRIBUTION")
+display(
+    model_data[
+        "behavior_cluster"
+    ].value_counts()
+    .sort_index()
+)
+
+cluster_adoption = (
+    model_data.groupby(
+        "behavior_cluster"
+    )["adopted"]
+    .agg(["mean", "count"])
+)
+
+print("\nADOPTION RATE BY CLUSTER")
+display(cluster_adoption)
+
+
+# =============================================================================
+# 15. DEFINE FEATURES AND TARGET
+# =============================================================================
+
+X = model_data.drop(
+    columns=[
+        "physician_id",
+        "adopted"
+    ]
+)
+
+y = model_data["adopted"]
+
+
+# =============================================================================
+# 16. TRAIN VALIDATION SPLIT
+# =============================================================================
+
+X_train, X_valid, y_train, y_valid = train_test_split(
+    X,
+    y,
+    test_size=0.20,
+    stratify=y,
+    random_state=RANDOM_STATE
+)
+
+print("\nTraining Shape:", X_train.shape)
+print("Validation Shape:", X_valid.shape)
+
+
+# =============================================================================
+# 17. PREPROCESSING PIPELINE
+# =============================================================================
+
+numeric_features = X.select_dtypes(
+    include=[
+        "int64",
+        "float64",
+        "int32",
+        "float32"
+    ]
+).columns.tolist()
+
+categorical_features = X.select_dtypes(
+    include=[
+        "object",
+        "category"
+    ]
+).columns.tolist()
+
+print("\nNumber of Numeric Features:",
+      len(numeric_features))
+
+print("Number of Categorical Features:",
+      len(categorical_features))
+
+
+# Numeric preprocessing
+numeric_transformer = Pipeline(
+    steps=[
+        (
+            "imputer",
+            SimpleImputer(strategy="median")
+        ),
+        (
+            "scaler",
+            StandardScaler()
+        )
+    ]
+)
+
+# Categorical preprocessing
+categorical_transformer = Pipeline(
+    steps=[
+        (
+            "imputer",
+            SimpleImputer(strategy="most_frequent")
+        ),
+        (
+            "encoder",
+            OneHotEncoder(
+                handle_unknown="ignore"
+            )
+        )
+    ]
+)
+
+preprocessor = ColumnTransformer(
+    transformers=[
+        (
+            "numeric",
+            numeric_transformer,
+            numeric_features
+        ),
+
+        (
+            "categorical",
+            categorical_transformer,
+            categorical_features
+        )
+    ]
+)
+
+
+# =============================================================================
+# 18. MODEL 1 – LOGISTIC REGRESSION
+# =============================================================================
+
+logistic_model = Pipeline(
+    steps=[
+        (
+            "preprocessor",
+            preprocessor
+        ),
+
+        (
+            "model",
+            LogisticRegression(
+                max_iter=3000,
+                class_weight="balanced",
+                random_state=RANDOM_STATE
+            )
+        )
+    ]
+)
+
+logistic_model.fit(
+    X_train,
+    y_train
+)
+
+logistic_probabilities = (
+    logistic_model.predict_proba(X_valid)[:, 1]
+)
+
+logistic_predictions = (
+    logistic_probabilities >= 0.50
+).astype(int)
+
+logistic_auc = roc_auc_score(
+    y_valid,
+    logistic_probabilities
+)
+
+logistic_f1 = f1_score(
+    y_valid,
+    logistic_predictions
+)
+
+logistic_precision = precision_score(
+    y_valid,
+    logistic_predictions,
+    zero_division=0
+)
+
+logistic_recall = recall_score(
+    y_valid,
+    logistic_predictions
+)
+
+print("\n" + "=" * 70)
+print("LOGISTIC REGRESSION RESULTS")
+print("=" * 70)
+
+print("AUC-ROC:", round(logistic_auc, 4))
+print("F1-Score:", round(logistic_f1, 4))
+print("Precision:", round(logistic_precision, 4))
+print("Recall:", round(logistic_recall, 4))
+
+
+# =============================================================================
+# 19. MODEL 2 – RANDOM FOREST WITH OOB SCORE
+# =============================================================================
+
+rf_model = Pipeline(
+    steps=[
+        (
+            "preprocessor",
+            preprocessor
+        ),
+
+        (
+            "model",
+            RandomForestClassifier(
+                n_estimators=400,
+                max_depth=12,
+                min_samples_leaf=5,
+                max_features="sqrt",
+                class_weight="balanced",
+                oob_score=True,
+                n_jobs=-1,
+                random_state=RANDOM_STATE
+            )
+        )
+    ]
+)
+
+rf_model.fit(
+    X_train,
+    y_train
+)
+
+rf_probabilities = (
+    rf_model.predict_proba(X_valid)[:, 1]
+)
+
+rf_predictions = (
+    rf_probabilities >= 0.50
+).astype(int)
+
+rf_auc = roc_auc_score(
+    y_valid,
+    rf_probabilities
+)
+
+rf_f1 = f1_score(
+    y_valid,
+    rf_predictions
+)
+
+rf_precision = precision_score(
+    y_valid,
+    rf_predictions,
+    zero_division=0
+)
+
+rf_recall = recall_score(
+    y_valid,
+    rf_predictions
+)
+
+rf_classifier = rf_model.named_steps["model"]
+
+print("\n" + "=" * 70)
+print("RANDOM FOREST RESULTS")
+print("=" * 70)
+
+print("AUC-ROC:", round(rf_auc, 4))
+print("F1-Score:", round(rf_f1, 4))
+print("Precision:", round(rf_precision, 4))
+print("Recall:", round(rf_recall, 4))
+print(
+    "OOB Score:",
+    round(rf_classifier.oob_score_, 4)
+)
+
+
+# =============================================================================
+# 20. MODEL 3 – GRADIENT BOOSTING WITH 5-FOLD CV
+# =============================================================================
+
+gb_pipeline = Pipeline(
+    steps=[
+        (
+            "preprocessor",
+            preprocessor
+        ),
+
+        (
+            "model",
+            GradientBoostingClassifier(
+                random_state=RANDOM_STATE
+            )
+        )
+    ]
+)
+
+gb_parameter_grid = {
+    "model__n_estimators": [100, 200],
+    "model__learning_rate": [0.05, 0.10],
+    "model__max_depth": [2, 3]
+}
+
+cv = StratifiedKFold(
+    n_splits=5,
+    shuffle=True,
+    random_state=RANDOM_STATE
+)
+
+gb_grid = GridSearchCV(
+    estimator=gb_pipeline,
+    param_grid=gb_parameter_grid,
+    scoring="roc_auc",
+    cv=cv,
+    n_jobs=-1,
+    verbose=1
+)
+
+gb_grid.fit(
+    X_train,
+    y_train
+)
+
+best_gb_model = gb_grid.best_estimator_
+
+gb_probabilities = (
+    best_gb_model.predict_proba(X_valid)[:, 1]
+)
+
+gb_predictions = (
+    gb_probabilities >= 0.50
+).astype(int)
+
+gb_auc = roc_auc_score(
+    y_valid,
+    gb_probabilities
+)
+
+gb_f1 = f1_score(
+    y_valid,
+    gb_predictions
+)
+
+gb_precision = precision_score(
+    y_valid,
+    gb_predictions,
+    zero_division=0
+)
+
+gb_recall = recall_score(
+    y_valid,
+    gb_predictions
+)
+
+print("\n" + "=" * 70)
+print("GRADIENT BOOSTING RESULTS")
+print("=" * 70)
+
+print("Best Parameters:", gb_grid.best_params_)
+print(
+    "Best Cross-Validation AUC:",
+    round(gb_grid.best_score_, 4)
+)
+print(
+    "Validation AUC-ROC:",
+    round(gb_auc, 4)
+)
+print(
+    "Validation F1-Score:",
+    round(gb_f1, 4)
+)
+
+
+# =============================================================================
+# 21. MODEL 4 – XGBOOST WITH 5-FOLD CROSS VALIDATION
+# =============================================================================
+# scale_pos_weight handles class imbalance.
+# =============================================================================
+
+negative_class = (y_train == 0).sum()
+positive_class = (y_train == 1).sum()
+
+scale_pos_weight = (
+    negative_class / positive_class
+)
+
+xgb_pipeline = Pipeline(
+    steps=[
+        (
+            "preprocessor",
+            preprocessor
+        ),
+
+        (
+            "model",
+            XGBClassifier(
+                objective="binary:logistic",
+                eval_metric="auc",
+                random_state=RANDOM_STATE,
+                n_jobs=-1,
+                scale_pos_weight=scale_pos_weight
+            )
+        )
+    ]
+)
+
+xgb_parameter_grid = {
+    "model__n_estimators": [200, 300],
+    "model__max_depth": [3, 4],
+    "model__learning_rate": [0.03, 0.05],
+    "model__subsample": [0.8],
+    "model__colsample_bytree": [0.8]
+}
+
+xgb_grid = GridSearchCV(
+    estimator=xgb_pipeline,
+    param_grid=xgb_parameter_grid,
+    scoring="roc_auc",
+    cv=cv,
+    n_jobs=-1,
+    verbose=1
+)
+
+xgb_grid.fit(
+    X_train,
+    y_train
+)
+
+best_xgb_model = xgb_grid.best_estimator_
+
+xgb_probabilities = (
+    best_xgb_model.predict_proba(X_valid)[:, 1]
+)
+
+xgb_predictions = (
+    xgb_probabilities >= 0.50
+).astype(int)
+
+xgb_auc = roc_auc_score(
+    y_valid,
+    xgb_probabilities
+)
+
+xgb_f1 = f1_score(
+    y_valid,
+    xgb_predictions
+)
+
+xgb_precision = precision_score(
+    y_valid,
+    xgb_predictions,
+    zero_division=0
+)
+
+xgb_recall = recall_score(
+    y_valid,
+    xgb_predictions
+)
+
+print("\n" + "=" * 70)
+print("XGBOOST RESULTS")
+print("=" * 70)
+
+print(
+    "Best Parameters:",
+    xgb_grid.best_params_
+)
+
+print(
+    "Best Cross-Validation AUC:",
+    round(xgb_grid.best_score_, 4)
+)
+
+print(
+    "Validation AUC-ROC:",
+    round(xgb_auc, 4)
+)
+
+print(
+    "Validation F1-Score:",
+    round(xgb_f1, 4)
+)
+
+print(
+    "Precision:",
+    round(xgb_precision, 4)
+)
+
+print(
+    "Recall:",
+    round(xgb_recall, 4)
+)
+
+
+# =============================================================================
+# 22. MODEL PERFORMANCE COMPARISON
+# =============================================================================
+
+performance_table = pd.DataFrame(
+    {
+        "Model": [
+            "Logistic Regression",
+            "Random Forest",
+            "Gradient Boosting",
+            "XGBoost"
+        ],
+
+        "Validation AUC-ROC": [
+            logistic_auc,
+            rf_auc,
+            gb_auc,
+            xgb_auc
+        ],
+
+        "Validation F1-Score": [
+            logistic_f1,
+            rf_f1,
+            gb_f1,
+            xgb_f1
+        ],
+
+        "Precision": [
+            logistic_precision,
+            rf_precision,
+            gb_precision,
+            xgb_precision
+        ],
+
+        "Recall": [
+            logistic_recall,
+            rf_recall,
+            gb_recall,
+            xgb_recall
+        ]
+    }
+)
+
+performance_table = (
+    performance_table
+    .sort_values(
+        "Validation AUC-ROC",
+        ascending=False
+    )
+    .reset_index(drop=True)
+)
+
+print("\n" + "=" * 70)
+print("FINAL MODEL COMPARISON")
+print("=" * 70)
+
+display(
+    performance_table.style.format(
+        {
+            "Validation AUC-ROC": "{:.4f}",
+            "Validation F1-Score": "{:.4f}",
+            "Precision": "{:.4f}",
+            "Recall": "{:.4f}"
+        }
+    )
+)
+
+
+# =============================================================================
+# 23. ROC CURVE COMPARISON
+# =============================================================================
+
+plt.figure(figsize=(9, 7))
+
+model_probabilities = {
+    "Logistic Regression":
+        logistic_probabilities,
+
+    "Random Forest":
+        rf_probabilities,
+
+    "Gradient Boosting":
+        gb_probabilities,
+
+    "XGBoost":
+        xgb_probabilities
+}
+
+for model_name, probabilities in model_probabilities.items():
+
+    fpr, tpr, _ = roc_curve(
+        y_valid,
+        probabilities
+    )
+
+    auc_score = roc_auc_score(
+        y_valid,
+        probabilities
+    )
+
+    plt.plot(
+        fpr,
+        tpr,
+        label=(
+            f"{model_name} "
+            f"(AUC = {auc_score:.3f})"
+        )
+    )
+
+plt.plot(
+    [0, 1],
+    [0, 1],
+    linestyle="--"
+)
+
+plt.xlabel("False Positive Rate")
+plt.ylabel("True Positive Rate")
+plt.title("ROC Curve – Model Comparison")
+plt.legend()
+plt.show()
+
+
+# =============================================================================
+# 24. SELECT BEST MODEL BASED ON VALIDATION AUC
+# =============================================================================
+
+model_auc_scores = {
+    "Logistic Regression": logistic_auc,
+    "Random Forest": rf_auc,
+    "Gradient Boosting": gb_auc,
+    "XGBoost": xgb_auc
+}
+
+best_model_name = max(
+    model_auc_scores,
+    key=model_auc_scores.get
+)
+
+model_dictionary = {
+    "Logistic Regression":
+        logistic_model,
+
+    "Random Forest":
+        rf_model,
+
+    "Gradient Boosting":
+        best_gb_model,
+
+    "XGBoost":
+        best_xgb_model
+}
+
+best_model = model_dictionary[
+    best_model_name
+]
+
+print("\n" + "=" * 70)
+print(
+    "SELECTED FINAL MODEL:",
+    best_model_name
+)
+print("=" * 70)
+
+
+# =============================================================================
+# 25. FEATURE IMPORTANCE USING PERMUTATION IMPORTANCE
+# =============================================================================
+# Permutation importance works with any of the final models.
+# =============================================================================
+
+permutation_results = permutation_importance(
+    best_model,
+    X_valid,
+    y_valid,
+    scoring="roc_auc",
+    n_repeats=5,
+    random_state=RANDOM_STATE,
+    n_jobs=-1
+)
+
+importance_df = pd.DataFrame(
+    {
+        "feature": X_valid.columns,
+        "importance":
+            permutation_results.importances_mean
+    }
+)
+
+importance_df = (
+    importance_df
+    .sort_values(
+        "importance",
+        ascending=False
+    )
+    .reset_index(drop=True)
+)
+
+print("\nTOP 15 ADOPTION DRIVERS")
+display(importance_df.head(15))
+
+top_features = importance_df.head(15)
+
+plt.figure(figsize=(10, 7))
+
+plt.barh(
+    top_features["feature"][::-1],
+    top_features["importance"][::-1]
+)
+
+plt.xlabel("Permutation Importance")
+plt.title(
+    f"Top 15 Adoption Drivers – "
+    f"{best_model_name}"
+)
+
+plt.show()
+
+
+# =============================================================================
+# 26. LOGISTIC REGRESSION COEFFICIENT INTERPRETATION
+# =============================================================================
+
+logistic_preprocessor = (
+    logistic_model.named_steps["preprocessor"]
+)
+
+logistic_classifier = (
+    logistic_model.named_steps["model"]
+)
+
+logistic_feature_names = (
+    logistic_preprocessor.get_feature_names_out()
+)
+
+coefficient_df = pd.DataFrame(
+    {
+        "feature":
+            logistic_feature_names,
+
+        "coefficient":
+            logistic_classifier.coef_[0]
+    }
+)
+
+print("\nTOP POSITIVE LOGISTIC DRIVERS")
+
+display(
+    coefficient_df
+    .sort_values(
+        "coefficient",
+        ascending=False
+    )
+    .head(10)
+)
+
+print("\nTOP NEGATIVE LOGISTIC DRIVERS")
+
+display(
+    coefficient_df
+    .sort_values(
+        "coefficient",
+        ascending=True
+    )
+    .head(10)
+)
+
+
+# =============================================================================
+# 27. CREATE FEATURES FOR TEST PHYSICIANS
+# =============================================================================
+
+test_ids = test_physicians[
+    ["physician_id"]
+].copy()
+
+# Get longitudinal history only for test physicians
+test_longitudinal = file1.merge(
+    test_ids,
+    on="physician_id",
+    how="inner"
+)
+
+# Get static profile only for test physicians
+test_static = file2.merge(
+    test_ids,
+    on="physician_id",
+    how="inner"
+)
+
+# Create the same engineered features
+test_features = create_physician_features(
+    test_longitudinal,
+    test_static
+)
+
+# Add territory-level features created from training population
+test_features = test_features.merge(
+    territory_features,
+    on="territory_code",
+    how="left"
+)
+
+# Create clusters using the already fitted scaler and KMeans model
+test_cluster_data = test_features[
+    clustering_columns
+].copy()
+
+test_cluster_data = test_cluster_data.fillna(
+    cluster_medians
+)
+
+test_cluster_scaled = (
+    cluster_scaler.transform(
+        test_cluster_data
+    )
+)
+
+test_features["behavior_cluster"] = (
+    kmeans.predict(
+        test_cluster_scaled
+    )
+)
+
+# Ensure same features and same column order as training data
+X_test = test_features[
+    X.columns
+].copy()
+
+print("\nTest feature matrix shape:",
+      X_test.shape)
+
+
+# =============================================================================
+# 28. GENERATE FINAL Q11 ADOPTION PREDICTIONS
+# =============================================================================
+
+test_probabilities = (
+    best_model.predict_proba(X_test)[:, 1]
+)
+
+# Default threshold requested in assignment
+test_predictions = (
+    test_probabilities >= 0.50
+).astype(int)
+
+predictions = pd.DataFrame(
+    {
+        "physician_id":
+            test_features["physician_id"],
+
+        "adoption_probability":
+            test_probabilities,
+
+        "adoption_prediction":
+            test_predictions
+    }
+)
+
+# Rank physicians by adoption probability
+predictions["rank"] = (
+    predictions["adoption_probability"]
+    .rank(
+        ascending=False,
+        method="first"
+    )
+    .astype(int)
+)
+
+# Identify primary outreach targets
+predictions["priority_group"] = np.where(
+    predictions["rank"] <= 200,
+    "Top 200 - Primary Target",
+    "Other Physicians"
+)
+
+predictions = predictions.sort_values(
+    "adoption_probability",
+    ascending=False
+).reset_index(drop=True)
+
+print("\nTOP 20 PHYSICIANS BY ADOPTION PROBABILITY")
+
+display(
+    predictions.head(20)
+)
+
+
+# =============================================================================
+# 29. CREATE FINAL PREDICTIONS FILE WITH ENGINEERED FEATURES
+# =============================================================================
+
+prediction_features = test_features.copy()
+
+predictions_final = predictions.merge(
+    prediction_features,
+    on="physician_id",
+    how="left"
+)
+
+predictions_final.to_csv(
+    "predictions.csv",
+    index=False
+)
+
+print(
+    "\npredictions.csv successfully created!"
+)
+
+print(
+    "Total physicians predicted:",
+    len(predictions_final)
+)
+
+
+# =============================================================================
+# 30. SAVE TOP 200 PRIORITY PHYSICIANS
+# =============================================================================
+
+top_200 = predictions[
+    predictions["rank"] <= 200
+].copy()
+
+top_200.to_csv(
+    "top_200_physicians.csv",
+    index=False
+)
+
+print(
+    "top_200_physicians.csv successfully created!"
+)
+
+
+# =============================================================================
+# 31. FINAL BUSINESS SUMMARY
+# =============================================================================
+
+print("\n" + "=" * 70)
+print("FINAL PROJECT SUMMARY")
+print("=" * 70)
+
+print(
+    f"Best Model Selected: {best_model_name}"
+)
+
+print(
+    f"Best Validation AUC: "
+    f"{model_auc_scores[best_model_name]:.4f}"
+)
+
+print(
+    f"Number of Test Physicians: "
+    f"{len(predictions)}"
+)
+
+print(
+    "Primary Sales Targets: Top 200 physicians"
+)
+
+print("\nTOP 10 PREDICTIVE DRIVERS:")
+
+for feature in importance_df.head(10)["feature"]:
+    print("-", feature)
+
+print("\nAll modelling and prediction steps completed successfully.")
