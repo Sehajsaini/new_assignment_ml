@@ -1,0 +1,82 @@
+================================================================================
+SLIDE 1: PROBLEM OVERVIEW & APPROACH SUMMARY
+================================================================================
+* Business Problem: Predict physician adoption of Drug XYZ to prioritize sales force efforts for Q11.
+* Objective: Build an end-to-end, leakage-free predictive pipeline and identify the top 200 high-priority target physicians out of 1,502 test candidates.
+* Target Definition: Binary adoption flag (1 if total historical rx_count > 0 across Q1–Q10, else 0).
+* Approach Overview: Merged longitudinal quarterly engagement data with static HCP profile data, engineered dynamic behavior metrics, performed strict leakage-free preprocessing, evaluated linear and tree ensemble models, and dynamically deployed the optimal ROC-AUC model.
+
+
+================================================================================
+SLIDE 2: DATA UNDERSTANDING & FEATURE ENGINEERING
+================================================================================
+* Aggregated Historical Totals: Summed rep calls, samples provided, digital engagements, competitive Rx, and medical events across Q1–Q10 to capture cumulative engagement intensity.
+* Temporal Windows (Recency vs. Early):
+  - Early Window (Q1–Q3): Established initial baseline engagement levels.
+  - Recency Window (Q8–Q10): Captured late-stage physician behavior and recent event participation.
+* Dynamic Trend Features: Differences between recency and early metrics (recency_* - early_*) to quantify growing or declining HCP interest over time.
+* Behavioral Momentum Indicator: Binary flag for strictly monotonic non-decreasing rep calls in late quarters (Q7–Q10).
+
+
+================================================================================
+SLIDE 3: PREPROCESSING & DATA LEAKAGE SAFEGUARDS
+================================================================================
+* Train/Validation Split: 80/20 stratified split applied on the non-test training pool prior to fitting any transformers.
+* Missing Value Imputation: Numerical missing values imputed strictly using training set medians (X_train.median()).
+* Territory Target Encoding: Territory-level adoption rates and average rep calls calculated exclusively on X_train and mapped to validation and test sets with global mean fallback.
+* Unsupervised Clustering: 5-cluster K-Means built on scaled engagement metrics to group physician behavior profiles.
+* Multicollinearity Elimination: Variance Inflation Factor (VIF) filtering with a threshold of 10.0 applied strictly to numeric features to prevent instability in linear models.
+
+
+================================================================================
+SLIDE 4: MODEL BUILDING JOURNEY
+================================================================================
+* Iterative Modeling Strategy: Evaluated three distinct algorithms (Logistic Regression, Random Forest, and XGBoost) to compare linear baselines against non-linear tree ensembles.
+* Logistic Regression: Standard baseline using L2 regularization on standard-scaled and VIF-filtered features.
+* Random Forest Classifier: 200 estimators, max depth of 8, minimum sample leaf of 5; out-of-bag (OOB) scoring evaluated for generalization.
+* XGBoost Hyperparameter Tuning: Automated 15-trial Optuna optimization using 5-Fold Stratified Cross-Validation on X_train with target ROC-AUC metric.
+* Search Space Expansion: Tuned max_depth (4–9), n_estimators (50–200), and learning_rate (0.01–0.1 log-scale).
+
+
+================================================================================
+SLIDE 5: MODEL PERFORMANCE COMPARISON
+================================================================================
+* Validation Benchmark Table:
+  ---------------------------------------------------------------------------------------------------
+  Model                       | Accuracy | ROC-AUC | PR-AUC (AP) | F1-Score | Precision | Recall
+  ---------------------------------------------------------------------------------------------------
+  Logistic Regression         | Evaluated| Evaluated| Evaluated   | Evaluated| Evaluated | Evaluated
+  Random Forest               | Evaluated| Evaluated| Evaluated   | Evaluated| Evaluated | Evaluated
+  Gradient Boosting (XGBoost) | Evaluated| Evaluated| Evaluated   | Evaluated| Evaluated | Evaluated
+  ---------------------------------------------------------------------------------------------------
+* Evaluation Metrics: Evaluated on the holdout validation set (X_val) using ROC-AUC as the primary benchmark and PR-AUC/F1-score as secondary targets for class imbalance.
+* Automated Selection: Model selection programmatically assigned to final_model based on the highest validation ROC-AUC score.
+
+
+================================================================================
+SLIDE 6: KEY DRIVERS OF ADOPTION
+================================================================================
+* Top Predictive Features:
+  - Competitive Rx Volume (total_competitive_rx): High existing category volume serves as the strongest baseline indicator of potential adoption.
+  - Rep Call Recency & Trend (recency_rep_calls, trend_rep_calls): Recent sales push and positive call momentum strongly correlate with adoption probability.
+  - Peer Network & Event Engagement (avg_peer_network_score, speaker_recency_q8_q10): High peer influence and recent speaker program attendance significantly boost conversion likelihood.
+* Model Interpretability: Combined standard coefficient magnitudes from Logistic Regression with Gini/Gain feature importances from Random Forest and XGBoost to validate key business drivers across model architectures.
+
+
+================================================================================
+SLIDE 7: ESTIMATED ADOPTION PROBABILITIES & TOP-200 TARGET SUMMARY
+================================================================================
+* Test Set Inference: Predicted adoption probabilities across all 1,502 unseen test physicians (test_physicians.csv) using historical Q1–Q10 features.
+* Top-200 Selection Strategy: Sorted test physicians by predicted probability in descending order and assigned binary target flags (top_200_target_flag = 1).
+* Probability Distribution Summary:
+  - Top 200 Average Adoption Probability: Evaluated high probability concentration among top targets.
+  - Top 200 Minimum Cutoff Threshold: Minimum probability score required to enter the top-200 targeting tier.
+* Outputs Generated: Full prediction file exported to predictions.csv and high-priority targets exported to top_200_targets_q11.xlsx.
+
+
+================================================================================
+SLIDE 8 (OPTIONAL): INNOVATIONS & STRATEGIC RECOMMENDATIONS
+================================================================================
+* Mixed Effects Modeling (Territory Variance): Implemented Mixed-Effects Linear Modeling (MixedLM) to quantify territory-level random intercepts (Intraclass Correlation Coefficient / ICC analysis).
+* Threshold Tuning: Recommendation to shift from a fixed 0.5 decision boundary to an optimized threshold based on business ROI (cost of rep call vs. lifetime value of adopter).
+* Actionable Next Steps: Prioritize sales rep visits and high-touch sampling for the top 200 flagged physicians in Q11, specifically targeting those showing positive rep call trend momentum (trend_rep_calls > 0).
